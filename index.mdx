@@ -1,97 +1,153 @@
 ---
-title: "Introduction"
-description: "Welcome to the new home for your documentation"
+title: "SlateDB Documentation"
+description: "A cloud native embedded storage engine built on object storage"
 ---
 
-## Setting up
+<div style={{ backgroundColor: '#1e1e1e', padding: '3rem 2rem', borderRadius: '6px', border: '1px solid #36756e', boxShadow: '4px 4px 6px rgba(0, 0, 0, 0.6)', marginBottom: '2rem' }}>
+  <h1 style={{ fontFamily: 'Courier New, monospace', fontSize: '36px', fontWeight: 700, color: '#d4d4d4', marginBottom: '1rem' }}>
+    SlateDB
+  </h1>
+  <p style={{ fontFamily: 'Courier New, monospace', fontSize: '14.4px', color: '#d4d4d4', marginBottom: '1.5rem' }}>
+    A cloud native embedded storage engine built as a log-structured merge-tree on object storage. Bottomless capacity, high durability, and easy replication.
+  </p>
+  <div style={{ display: 'flex', gap: '1rem', flexWrap: 'wrap' }}>
+    <a href="/quickstart" style={{ 
+      backgroundColor: '#fbbf24', 
+      color: '#000000', 
+      padding: '0.75rem 1.5rem', 
+      borderRadius: '2px', 
+      fontFamily: 'Courier New, monospace',
+      fontWeight: 600,
+      textDecoration: 'none',
+      display: 'inline-block'
+    }}>
+      Get Started
+    </a>
+    <a href="https://github.com/slatedb/slatedb" style={{ 
+      backgroundColor: '#6366f1', 
+      color: '#ffffff', 
+      padding: '0.75rem 1.5rem', 
+      borderRadius: '2px', 
+      fontFamily: 'Courier New, monospace',
+      fontWeight: 600,
+      textDecoration: 'none',
+      display: 'inline-block'
+    }}>
+      View on GitHub
+    </a>
+  </div>
+</div>
 
-Get your documentation site up and running in minutes.
+## Why SlateDB?
 
-<Card
-  title="Start here"
-  icon="rocket"
-  href="/quickstart"
-  horizontal
->
-  Follow our three step quickstart guide.
-</Card>
+SlateDB is an embedded storage engine that leverages object storage (S3, GCS, Azure, MinIO) as its primary storage layer. Unlike traditional LSM-tree engines that write to local disk, SlateDB writes directly to object storage, providing:
 
-## Make it yours
+- **Bottomless storage capacity** — No need to provision disk space
+- **High durability** — Built-in replication and redundancy from object storage
+- **Easy cloning and replication** — Copy databases by copying object prefixes
+- **Cost-effective storage** — Pay for what you use with object storage pricing
 
-Design a docs site that looks great and empowers your users.
-
-<Columns cols={2}>
-  <Card
-    title="Edit locally"
-    icon="pen-to-square"
-    href="/development"
-  >
-    Edit your docs locally and preview them in real time.
+<CardGroup cols={2}>
+  <Card title="Quick Start" icon="rocket" href="/quickstart">
+    Get up and running with SlateDB in minutes
   </Card>
-  <Card
-    title="Customize your site"
-    icon="palette"
-    href="/essentials/settings"
-  >
-    Customize the design and colors of your site to match your brand.
+  <Card title="Architecture" icon="sitemap" href="/concepts/architecture">
+    Learn how SlateDB works under the hood
   </Card>
-    <Card
-    title="Set up navigation"
-    icon="map"
-    href="/essentials/navigation"
-  >
-    Organize your docs to help users find what they need and succeed with your product.
+  <Card title="API Reference" icon="code" href="/api/db">
+    Explore the complete API documentation
   </Card>
-  <Card
-    title="API documentation"
-    icon="terminal"
-    href="/api-reference/introduction"
-  >
-    Auto-generate API documentation from OpenAPI specifications.
+  <Card title="Language Bindings" icon="globe" href="/bindings/rust">
+    Use SlateDB from Rust, Go, Java, or Python
   </Card>
-</Columns>
+</CardGroup>
 
-## Create beautiful pages
+## Key Features
 
-Everything you need to create world-class documentation.
+<CardGroup cols={3}>
+  <Card title="LSM-Tree Storage" icon="database">
+    Modern log-structured merge-tree architecture optimized for object storage
+  </Card>
+  <Card title="ACID Transactions" icon="lock">
+    Full transaction support with configurable isolation levels
+  </Card>
+  <Card title="Snapshots" icon="camera">
+    Point-in-time consistent views of your data
+  </Card>
+  <Card title="Range Queries" icon="magnifying-glass">
+    Efficient scanning and iteration over key ranges
+  </Card>
+  <Card title="Compression" icon="file-zipper">
+    Multiple compression algorithms: Snappy, LZ4, Zstd
+  </Card>
+  <Card title="Caching" icon="bolt">
+    Block cache and disk cache for optimal performance
+  </Card>
+  <Card title="Compaction" icon="layer-group">
+    Automatic background compaction with configurable strategies
+  </Card>
+  <Card title="Change Data Capture" icon="stream">
+    Stream data changes for real-time processing
+  </Card>
+  <Card title="Merge Operators" icon="code-merge">
+    Atomic read-modify-write operations
+  </Card>
+</CardGroup>
 
-<Columns cols={2}>
-  <Card
-    title="Write with MDX"
-    icon="pen-fancy"
-    href="/essentials/markdown"
-  >
-    Use MDX to style your docs pages.
-  </Card>
-  <Card
-    title="Code samples"
-    icon="code"
-    href="/essentials/code"
-  >
-    Add sample code to demonstrate how to use your product.
-  </Card>
-  <Card
-    title="Images"
-    icon="image"
-    href="/essentials/images"
-  >
-    Display images and other media.
-  </Card>
-  <Card
-    title="Reusable snippets"
-    icon="recycle"
-    href="/essentials/reusable-snippets"
-  >
-    Write once and reuse across your docs.
-  </Card>
-</Columns>
+## Quick Example
 
-## Need inspiration?
+Get started with SlateDB in your Rust project:
 
-<Card
-  title="See complete examples"
-  icon="stars"
-  href="https://mintlify.com/customers"
->
-  Browse our showcase of exceptional documentation sites.
-</Card>
+```rust
+use slatedb::{Db, Error};
+use slatedb::object_store::{ObjectStore, memory::InMemory};
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> Result<(), Error> {
+    // Setup
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let db = Db::open("/tmp/my_database", object_store).await?;
+
+    // Put
+    db.put(b"hello", b"world").await?;
+
+    // Get
+    let value = db.get(b"hello").await?;
+    assert_eq!(value, Some("world".into()));
+
+    // Delete
+    db.delete(b"hello").await?;
+
+    Ok(())
+}
+```
+
+## Supported Object Storage
+
+SlateDB works with any S3-compatible object storage:
+
+<CardGroup cols={2}>
+  <Card title="AWS S3" icon="aws" href="/object-storage/aws-s3">
+    Amazon S3 and compatible services
+  </Card>
+  <Card title="Google Cloud Storage" icon="google" href="/object-storage/google-cloud-storage">
+    GCS with S3 compatibility API
+  </Card>
+  <Card title="Azure Blob Storage" icon="microsoft" href="/object-storage/azure-blob">
+    Azure Blob Storage integration
+  </Card>
+  <Card title="S3-Compatible" icon="server" href="/object-storage/s3-compatible">
+    MinIO, Tigris, and other S3-compatible services
+  </Card>
+</CardGroup>
+
+## Community
+
+Join the SlateDB community:
+
+- **Discord** — [Join our Discord server](https://discord.gg/mHYmGy5MgA) for discussions and support
+- **GitHub** — [Star us on GitHub](https://github.com/slatedb/slatedb) and contribute
+- **Website** — Visit [slatedb.io](https://slatedb.io) for more information
+
+SlateDB is a member of the [Commonhaus Foundation](https://www.commonhaus.org/) and licensed under Apache-2.0.

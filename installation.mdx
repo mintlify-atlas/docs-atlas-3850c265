@@ -1,0 +1,388 @@
+---
+title: Installation
+description: Add SlateDB to your Rust project with Cargo
+---
+
+SlateDB is distributed as a Rust crate via [crates.io](https://crates.io/crates/slatedb). This guide covers installation options, feature flags, and dependency configuration.
+
+## Basic Installation
+
+Add SlateDB to your project's `Cargo.toml`:
+
+<CodeGroup>
+```toml Latest Version
+[dependencies]
+slatedb = "*"
+tokio = { version = "1", features = ["full"] }
+```
+
+```toml Specific Version
+[dependencies]
+slatedb = "0.11.1"
+tokio = { version = "1", features = ["full"] }
+```
+
+```toml From Git
+[dependencies]
+slatedb = { git = "https://github.com/slatedb/slatedb", branch = "main" }
+tokio = { version = "1", features = ["full"] }
+```
+</CodeGroup>
+
+<Note>
+SlateDB requires the Tokio async runtime. Make sure to include Tokio with appropriate features for your use case.
+</Note>
+
+## Feature Flags
+
+SlateDB provides several optional features to customize functionality and reduce binary size. Features are enabled in your `Cargo.toml`:
+
+```toml
+[dependencies]
+slatedb = { version = "*", features = ["aws", "compression"] }
+```
+
+### Object Storage Backends
+
+Choose the object storage providers you need:
+
+<CodeGroup>
+```toml AWS S3 (Default)
+[dependencies]
+slatedb = { version = "*", features = ["aws"] }
+```
+
+```toml Azure Blob Storage
+[dependencies]
+slatedb = { version = "*", features = ["azure"] }
+```
+
+```toml OpenDAL (Multiple Providers)
+[dependencies]
+slatedb = { version = "*", features = ["opendal"] }
+```
+
+```toml Multiple Backends
+[dependencies]
+slatedb = { version = "*", features = ["aws", "azure"] }
+```
+</CodeGroup>
+
+<Note>
+**Default Features**: By default, SlateDB enables `aws` and `foyer` features. Use `default-features = false` to opt out.
+</Note>
+
+### Compression Algorithms
+
+Enable compression support to reduce storage costs and improve read performance:
+
+| Feature | Algorithm | Speed | Compression Ratio | Use Case |
+|---------|-----------|-------|-------------------|----------|
+| `snappy` | Snappy | Very Fast | Moderate | General purpose, low CPU overhead |
+| `lz4` | LZ4 | Very Fast | Moderate | Similar to Snappy, slightly faster |
+| `zlib` | Zlib/Deflate | Moderate | Good | Better compression, more CPU |
+| `zstd` | Zstandard | Moderate | Excellent | Best compression, configurable |
+| `compression` | Snappy (alias) | Very Fast | Moderate | Shorthand for `snappy` |
+
+<CodeGroup>
+```toml Snappy (Recommended)
+[dependencies]
+slatedb = { version = "*", features = ["snappy"] }
+```
+
+```toml LZ4
+[dependencies]
+slatedb = { version = "*", features = ["lz4"] }
+```
+
+```toml Zstandard
+[dependencies]
+slatedb = { version = "*", features = ["zstd"] }
+```
+
+```toml Multiple Algorithms
+[dependencies]
+slatedb = { version = "*", features = ["snappy", "zstd"] }
+```
+</CodeGroup>
+
+<Warning>
+Enabling compression requires setting `compression_codec` in your database configuration. Simply enabling the feature flag is not enough.
+</Warning>
+
+### Block Cache Implementations
+
+SlateDB supports two block cache implementations:
+
+<CodeGroup>
+```toml Foyer (Default, Recommended)
+[dependencies]
+slatedb = { version = "*", features = ["foyer"] }
+```
+
+```toml Moka
+[dependencies]
+slatedb = { version = "*", features = ["moka"] }
+```
+
+```toml Both (Choose at Runtime)
+[dependencies]
+slatedb = { version = "*", features = ["foyer", "moka"] }
+```
+</CodeGroup>
+
+**Foyer** is the default and recommended cache implementation. It provides:
+- Better memory management
+- Hybrid memory/disk caching
+- More predictable performance
+
+**Moka** is an alternative that offers:
+- Simpler configuration
+- Lower memory overhead
+- TTL and TTI support
+
+### Advanced Features
+
+<CodeGroup>
+```toml Disable WAL
+[dependencies]
+slatedb = { version = "*", features = ["wal_disable"] }
+```
+
+```toml Compaction Filters
+[dependencies]
+slatedb = { version = "*", features = ["compaction_filters"] }
+```
+
+```toml Testing Utilities
+[dependencies]
+slatedb = { version = "*", features = ["test-util"] }
+```
+</CodeGroup>
+
+<Warning>
+The `compaction_filters` feature enables custom compaction filter logic but may affect snapshot consistency. Use with caution in production.
+</Warning>
+
+### Complete Feature Reference
+
+| Feature | Description | Default |
+|---------|-------------|--------|
+| `aws` | Amazon S3 support | Yes |
+| `azure` | Azure Blob Storage support | No |
+| `opendal` | OpenDAL multi-backend support | No |
+| `foyer` | Foyer block cache implementation | Yes |
+| `moka` | Moka block cache implementation | No |
+| `snappy` | Snappy compression | No |
+| `lz4` | LZ4 compression | No |
+| `zlib` | Zlib compression | No |
+| `zstd` | Zstandard compression | No |
+| `compression` | Alias for `snappy` | No |
+| `wal_disable` | Allow disabling WAL | No |
+| `compaction_filters` | Custom compaction filters | No |
+| `test-util` | Testing utilities | No |
+| `bencher` | Benchmarking utilities | No |
+| `all` | All features except experimental | No |
+
+## Minimal Installation
+
+For the smallest binary size, disable default features and enable only what you need:
+
+```toml Cargo.toml
+[dependencies]
+slatedb = { version = "*", default-features = false, features = ["aws"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+```
+
+This configuration:
+- Disables the default Foyer cache (reduces dependencies)
+- Includes only AWS S3 support
+- Omits compression support
+- Results in a smaller binary
+
+<Warning>
+Without a block cache (`foyer` or `moka`), reads will always hit object storage, significantly degrading performance.
+</Warning>
+
+## Production-Ready Configuration
+
+For production deployments, we recommend:
+
+```toml Cargo.toml
+[dependencies]
+slatedb = { version = "*", features = ["aws", "foyer", "snappy"] }
+tokio = { version = "1", features = ["full"] }
+object_store = "0.12"
+
+# For structured logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# For error handling
+anyhow = "1.0"
+```
+
+This setup includes:
+- **AWS S3 support**: For production object storage
+- **Foyer cache**: Best-in-class block caching
+- **Snappy compression**: Good balance of speed and compression
+- **Tracing**: For observability
+- **Error handling**: Ergonomic error management
+
+## Additional Dependencies
+
+Depending on your use case, you may need:
+
+<CodeGroup>
+```toml Object Store Builders
+[dependencies]
+object_store = "0.12"
+```
+
+```toml Error Handling
+[dependencies]
+anyhow = "1.0"
+thiserror = "1.0"
+```
+
+```toml Serialization
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+```
+
+```toml Async Utilities
+[dependencies]
+futures = "0.3"
+tokio = { version = "1", features = ["full"] }
+```
+</CodeGroup>
+
+## Workspace Configuration
+
+If you're building multiple crates that use SlateDB, consider a workspace configuration:
+
+```toml Workspace Cargo.toml
+[workspace]
+members = ["app", "worker", "tests"]
+
+[workspace.dependencies]
+slatedb = { version = "0.11.1", features = ["aws", "foyer", "snappy"] }
+tokio = { version = "1", features = ["full"] }
+object_store = "0.12"
+```
+
+```toml app/Cargo.toml
+[package]
+name = "app"
+
+[dependencies]
+slatedb = { workspace = true }
+tokio = { workspace = true }
+object_store = { workspace = true }
+```
+
+## Verifying Installation
+
+After adding SlateDB to your `Cargo.toml`, verify it compiles:
+
+```bash
+cargo check
+```
+
+Run a simple test to ensure everything works:
+
+```rust src/main.rs
+use slatedb::{Db, Error};
+use slatedb::object_store::memory::InMemory;
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> Result<(), Error> {
+    let object_store = Arc::new(InMemory::new());
+    let db = Db::open("/tmp/test", object_store).await?;
+    db.put(b"test", b"works").await?;
+    assert_eq!(db.get(b"test").await?, Some(b"works".to_vec().into()));
+    db.close().await?;
+    println!("SlateDB is working!");
+    Ok(())
+}
+```
+
+Run it:
+
+```bash
+cargo run
+```
+
+You should see:
+
+```
+SlateDB is working!
+```
+
+## Build Profile Optimization
+
+For better performance, configure your release profile:
+
+```toml Cargo.toml
+[profile.release]
+lto = "thin"
+codegen-units = 1
+opt-level = 3
+```
+
+This enables:
+- **Link-Time Optimization (LTO)**: Better optimization across crate boundaries
+- **Single codegen unit**: Better optimization at the cost of compile time
+- **Aggressive optimization**: Maximum runtime performance
+
+<Note>
+These optimizations increase compile time but improve runtime performance by 10-30%.
+</Note>
+
+## Version Compatibility
+
+<Warning>
+SlateDB guarantees storage format compatibility between adjacent versions but does not guarantee API stability. Always check the changelog when upgrading.
+</Warning>
+
+SlateDB follows Semantic Versioning with these guarantees:
+
+- **Storage format**: Forward/backward compatible between adjacent versions
+- **API**: May break between minor versions (currently pre-1.0)
+- **Dependencies**: Regularly updated to latest stable versions
+
+## Release Schedule
+
+SlateDB releases approximately every 2 months at the end of even months:
+- February, April, June, August, October, December
+
+## Platform Support
+
+SlateDB is tested on:
+
+- **Linux**: x86_64, aarch64
+- **macOS**: x86_64, Apple Silicon (M1/M2)
+- **Windows**: x86_64
+
+<Note>
+Linux x86_64 receives the most testing and is recommended for production deployments.
+</Note>
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Build your first SlateDB application
+  </Card>
+  <Card title="Configuration" icon="sliders" href="/configuration">
+    Learn about configuration options
+  </Card>
+  <Card title="API Reference" icon="book" href="/api/db">
+    Explore the complete API
+  </Card>
+  <Card title="Guides" icon="code" href="/guides/basic-operations">
+    See real-world usage patterns
+  </Card>
+</CardGroup>

@@ -1,0 +1,354 @@
+---
+title: 'ScanOptions'
+description: 'Configure scan and iteration behavior in SlateDB'
+icon: 'sliders'
+---
+
+## Overview
+
+`ScanOptions` allows you to customize the behavior of scan operations in SlateDB. You can control data durability filters, read-ahead behavior, caching, and concurrency to optimize for your specific use case.
+
+## Creating ScanOptions
+
+```rust
+use slatedb::config::ScanOptions;
+
+// Use default options
+let options = ScanOptions::new();
+
+// Or get default explicitly
+let options = ScanOptions::default();
+```
+
+## Options
+
+### durability_filter
+
+Specifies the minimum durability level for data returned by the scan.
+
+**Type**: `DurabilityLevel`
+
+**Default**: `DurabilityLevel::Memory`
+
+**Values**:
+- `DurabilityLevel::Memory` - Includes data in memory and object storage
+- `DurabilityLevel::Remote` - Only data durably stored in object storage
+
+```rust
+use slatedb::config::{ScanOptions, DurabilityLevel};
+
+let options = ScanOptions::new()
+    .with_durability_filter(DurabilityLevel::Remote);
+
+let mut iter = db.scan_with_options(.., options).await?;
+```
+
+<Note>
+  Use `DurabilityLevel::Remote` when you need to ensure all returned data has been durably persisted to object storage. This is useful for disaster recovery scenarios or when reading from secondary readers.
+</Note>
+
+### dirty
+
+Whether to include "dirty" (uncommitted) data in the scan. Dirty data has a sequence number greater than the last committed sequence number.
+
+**Type**: `bool`
+
+**Default**: `false`
+
+```rust
+let options = ScanOptions::new()
+    .with_dirty(true);
+
+let mut iter = db.scan_with_options(.., options).await?;
+```
+
+<Warning>
+  Setting `dirty` to `true` means the scan may return data that hasn't been committed yet. This can be useful for debugging or specific use cases, but generally you should leave this as `false`.
+</Warning>
+
+### read_ahead_bytes
+
+The number of bytes to read ahead during scans. This value is rounded up to the nearest block size when fetching from object storage.
+
+**Type**: `usize`
+
+**Default**: `1` (rounds up to one block)
+
+```rust
+let options = ScanOptions::new()
+    .with_read_ahead_bytes(1024 * 1024); // 1MB read-ahead
+
+let mut iter = db.scan_with_options(.., options).await?;
+```
+
+**Performance Impact**:
+
+<CardGroup cols={2}>
+  <Card title="Larger values" icon="plus">
+    - Fewer object storage requests
+    - Better throughput for sequential scans
+    - Higher memory usage
+    - Wasted bandwidth if not all data is used
+  </Card>
+  <Card title="Smaller values" icon="minus">
+    - More object storage requests
+    - Lower memory usage
+    - Better for sparse or random access patterns
+    - Higher latency for sequential scans
+  </Card>
+</CardGroup>
+
+```rust
+// Sequential scan - use larger read-ahead
+let seq_options = ScanOptions::new()
+    .with_read_ahead_bytes(4 * 1024 * 1024); // 4MB
+
+let mut iter = db.scan_with_options(.., seq_options).await?;
+while let Some(kv) = iter.next().await? {
+    // Process sequentially
+}
+
+// Sparse scan with seeks - use smaller read-ahead
+let sparse_options = ScanOptions::new()
+    .with_read_ahead_bytes(64 * 1024); // 64KB
+
+let mut iter = db.scan_with_options(.., sparse_options).await?;
+while let Some(kv) = iter.next().await? {
+    // Skip ahead frequently
+    iter.seek(/* next key */).await?;
+}
+```
+
+### cache_blocks
+
+Whether fetched blocks should be cached for subsequent reads.
+
+**Type**: `bool`
+
+**Default**: `false`
+
+```rust
+let options = ScanOptions::new()
+    .with_cache_blocks(true);
+
+let mut iter = db.scan_with_options(.., options).await?;
+```
+
+<Tip>
+  Enable `cache_blocks` when:
+  - You expect to scan the same data multiple times
+  - You have sufficient memory for caching
+  - The data access pattern has temporal locality
+  
+  Keep it disabled for:
+  - One-time scans of large datasets
+  - Memory-constrained environments
+  - Purely sequential access with no reuse
+</Tip>
+
+### max_fetch_tasks
+
+The maximum number of concurrent tasks for fetching blocks during scans.
+
+**Type**: `usize`
+
+**Default**: `1`
+
+```rust
+let options = ScanOptions::new()
+    .with_max_fetch_tasks(4); // Use 4 concurrent fetch tasks
+
+let mut iter = db.scan_with_options(.., options).await?;
+```
+
+**Tuning Guidelines**:
+
+- **Higher values** (4-8): Better for high-latency storage (e.g., S3) with good throughput
+- **Lower values** (1-2): Better for low-latency storage or when resources are limited
+- **Consider**: Available CPU cores, network bandwidth, and object storage rate limits
+
+```rust
+// High-latency object storage (S3)
+let s3_options = ScanOptions::new()
+    .with_max_fetch_tasks(8)
+    .with_read_ahead_bytes(2 * 1024 * 1024);
+
+// Local/fast storage
+let local_options = ScanOptions::new()
+    .with_max_fetch_tasks(2)
+    .with_read_ahead_bytes(512 * 1024);
+```
+
+## Common Usage Patterns
+
+### Full Table Scan (High Throughput)
+
+Optimize for scanning large amounts of data sequentially:
+
+```rust
+let options = ScanOptions::new()
+    .with_read_ahead_bytes(4 * 1024 * 1024)  // 4MB read-ahead
+    .with_max_fetch_tasks(8)                 // High concurrency
+    .with_cache_blocks(false);               // No caching for one-time scan
+
+let mut iter = db.scan_with_options(.., options).await?;
+while let Some(kv) = iter.next().await? {
+    // Process each entry
+}
+```
+
+### Repeated Scans (Optimize for Latency)
+
+Optimize for repeatedly scanning the same data:
+
+```rust
+let options = ScanOptions::new()
+    .with_read_ahead_bytes(1024 * 1024)  // 1MB read-ahead
+    .with_max_fetch_tasks(4)              // Moderate concurrency
+    .with_cache_blocks(true);             // Enable caching
+
+// First scan - warms up cache
+let mut iter = db.scan_with_options(.., options.clone()).await?;
+while let Some(_) = iter.next().await? {}
+
+// Second scan - uses cached data
+let mut iter = db.scan_with_options(.., options).await?;
+while let Some(_) = iter.next().await? {}
+```
+
+### Sparse Access Pattern
+
+Optimize for scanning with frequent seeks:
+
+```rust
+let options = ScanOptions::new()
+    .with_read_ahead_bytes(64 * 1024)  // Small read-ahead (64KB)
+    .with_max_fetch_tasks(2)            // Lower concurrency
+    .with_cache_blocks(true);           // Cache frequently accessed blocks
+
+let mut iter = db.scan_with_options(b"key:000"..b"key:999", options).await?;
+
+// Scan with seeks
+let keys_to_check = vec![b"key:100", b"key:300", b"key:700"];
+for key in keys_to_check {
+    iter.seek(key).await?;
+    if let Some(kv) = iter.next().await? {
+        // Process this key
+    }
+}
+```
+
+### Durable Reads Only
+
+Only read data that has been durably persisted:
+
+```rust
+let options = ScanOptions::new()
+    .with_durability_filter(DurabilityLevel::Remote)
+    .with_dirty(false);  // Exclude uncommitted data
+
+let mut iter = db.scan_with_options(.., options).await?;
+// Only durably persisted, committed data will be returned
+```
+
+### Memory-Constrained Scan
+
+Minimize memory usage during scans:
+
+```rust
+let options = ScanOptions::new()
+    .with_read_ahead_bytes(1)        // Minimal read-ahead
+    .with_max_fetch_tasks(1)         // No parallelism
+    .with_cache_blocks(false);       // No caching
+
+let mut iter = db.scan_with_options(.., options).await?;
+while let Some(kv) = iter.next().await? {
+    // Process with minimal memory overhead
+}
+```
+
+## Combining with Other Options
+
+### With ReadOptions
+
+`ScanOptions` is specifically for scans. For point reads, use `ReadOptions`:
+
+```rust
+use slatedb::config::{ReadOptions, DurabilityLevel};
+
+// For scans
+let scan_opts = ScanOptions::new()
+    .with_durability_filter(DurabilityLevel::Remote);
+let mut iter = db.scan_with_options(.., scan_opts).await?;
+
+// For point reads
+let read_opts = ReadOptions::new()
+    .with_durability_filter(DurabilityLevel::Remote);
+let value = db.get_with_options(b"key", read_opts).await?;
+```
+
+### With Transactions
+
+Scans within transactions can use `ScanOptions`:
+
+```rust
+let txn = db.begin_transaction().await?;
+
+let options = ScanOptions::new()
+    .with_read_ahead_bytes(1024 * 1024);
+
+let mut iter = txn.scan_with_options(.., options).await?;
+while let Some(kv) = iter.next().await? {
+    // Process within transaction context
+}
+
+txn.commit().await?;
+```
+
+## Performance Tuning
+
+### Benchmarking
+
+Test different configurations to find optimal settings:
+
+```rust
+use std::time::Instant;
+
+async fn benchmark_scan_options(
+    db: &Db,
+    read_ahead: usize,
+    max_tasks: usize,
+) -> std::time::Duration {
+    let options = ScanOptions::new()
+        .with_read_ahead_bytes(read_ahead)
+        .with_max_fetch_tasks(max_tasks);
+    
+    let start = Instant::now();
+    let mut iter = db.scan_with_options(.., options).await.unwrap();
+    let mut count = 0;
+    while let Some(_) = iter.next().await.unwrap() {
+        count += 1;
+    }
+    let elapsed = start.elapsed();
+    
+    println!("Scanned {} entries in {:?}", count, elapsed);
+    elapsed
+}
+
+// Test different configurations
+let configs = vec![
+    (64 * 1024, 1),      // 64KB, 1 task
+    (1024 * 1024, 4),    // 1MB, 4 tasks
+    (4 * 1024 * 1024, 8), // 4MB, 8 tasks
+];
+
+for (read_ahead, max_tasks) in configs {
+    benchmark_scan_options(&db, read_ahead, max_tasks).await;
+}
+```
+
+## See Also
+
+- [DbIterator](/api/db-iterator) - Iterator API for scanning
+- [Db](/api/db) - Database API with read/scan methods
+- [Range Queries Guide](/guides/range-queries) - Practical scanning examples

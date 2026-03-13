@@ -1,0 +1,495 @@
+---
+title: S3-Compatible Storage
+description: Configure SlateDB with S3-compatible object storage services like MinIO and LocalStack
+---
+
+SlateDB works with any S3-compatible object storage service, including MinIO, LocalStack, Ceph, and others. This is useful for local development, testing, or deploying to environments with S3-compatible storage.
+
+## Supported Services
+
+- **MinIO**: Self-hosted, high-performance object storage
+- **LocalStack**: Local AWS cloud stack for testing
+- **Ceph**: Distributed storage system with S3-compatible API
+- **DigitalOcean Spaces**: S3-compatible object storage
+- **Wasabi**: S3-compatible cloud storage
+- **Cloudflare R2**: S3-compatible storage with zero egress fees
+- **Backblaze B2**: S3-compatible cloud storage
+
+## Prerequisites
+
+```toml Cargo.toml
+[dependencies]
+slatedb = "*"
+object_store = { version = "*", features = ["aws"] }
+```
+
+<Note>
+  S3-compatible services use the same `aws` feature and `AmazonS3Builder` from the object_store crate.
+</Note>
+
+## LocalStack Configuration
+
+LocalStack is perfect for local development and testing.
+
+### Start LocalStack
+
+```bash
+# Using Docker
+docker run -d \
+    --name localstack \
+    -p 4566:4566 \
+    -e SERVICES=s3 \
+    localstack/localstack
+
+# Create a bucket
+aws --endpoint-url=http://localhost:4566 s3 mb s3://slatedb
+```
+
+### Configure SlateDB for LocalStack
+
+```rust examples/src/s3_compatible.rs
+use object_store::aws::S3ConditionalPut;
+use slatedb::Db;
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let object_store = Arc::new(
+        object_store::aws::AmazonS3Builder::new()
+            // These will be different if you are using real AWS
+            .with_allow_http(true)
+            .with_endpoint("http://localhost:4566")
+            .with_access_key_id("test")
+            .with_secret_access_key("test")
+            .with_bucket_name("slatedb")
+            .with_region("us-east-1")
+            .with_conditional_put(S3ConditionalPut::ETagMatch)
+            .build()?
+    );
+
+    let db = Db::open("/tmp/slatedb_s3_compatible", object_store.clone()).await?;
+
+    // Call db.put with a key and a 64 meg value to trigger L0 SST flush
+    let value: Vec<u8> = vec![0; 64 * 1024 * 1024];
+    db.put(b"k1", value.as_slice()).await?;
+    db.close().await?;
+
+    Ok(())
+}
+```
+
+<Warning>
+  Always set `.with_conditional_put(S3ConditionalPut::ETagMatch)` to ensure data consistency.
+</Warning>
+
+## MinIO Configuration
+
+MinIO is a popular self-hosted object storage server.
+
+### Start MinIO
+
+```bash
+# Using Docker
+docker run -d \
+    --name minio \
+    -p 9000:9000 \
+    -p 9001:9001 \
+    -e MINIO_ROOT_USER=minioadmin \
+    -e MINIO_ROOT_PASSWORD=minioadmin \
+    minio/minio server /data --console-address ":9001"
+
+# Create a bucket using mc (MinIO Client)
+docker run --rm --network host minio/mc \
+    alias set local http://localhost:9000 minioadmin minioadmin
+
+docker run --rm --network host minio/mc \
+    mb local/slatedb
+```
+
+### Configure SlateDB for MinIO
+
+<CodeGroup>
+
+```rust HTTP (Development)
+use object_store::aws::{AmazonS3Builder, S3ConditionalPut};
+use slatedb::Db;
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let minio_store = Arc::new(
+        AmazonS3Builder::new()
+            .with_endpoint("http://localhost:9000")
+            .with_access_key_id("minioadmin")
+            .with_secret_access_key("minioadmin")
+            .with_bucket_name("slatedb")
+            .with_region("us-east-1")  // MinIO doesn't enforce region
+            .with_allow_http(true)
+            .with_conditional_put(S3ConditionalPut::ETagMatch)
+            .build()?
+    );
+
+    let db = Db::open("/tmp/slatedb_minio", minio_store).await?;
+    
+    db.put(b"key", b"value").await?;
+    println!("Value: {:?}", db.get(b"key").await?);
+    
+    db.close().await?;
+    
+    Ok(())
+}
+```
+
+```rust HTTPS (Production)
+use object_store::aws::{AmazonS3Builder, S3ConditionalPut};
+use slatedb::Db;
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let minio_store = Arc::new(
+        AmazonS3Builder::new()
+            .with_endpoint("https://minio.example.com")
+            .with_access_key_id("your-access-key")
+            .with_secret_access_key("your-secret-key")
+            .with_bucket_name("slatedb")
+            .with_region("us-east-1")
+            .with_conditional_put(S3ConditionalPut::ETagMatch)
+            .build()?
+    );
+
+    let db = Db::open("/tmp/slatedb_minio", minio_store).await?;
+    
+    db.put(b"key", b"value").await?;
+    db.close().await?;
+    
+    Ok(())
+}
+```
+
+</CodeGroup>
+
+## Cloudflare R2
+
+Cloudflare R2 is S3-compatible and offers zero egress fees.
+
+### Configure SlateDB for R2
+
+```rust
+use object_store::aws::{AmazonS3Builder, S3ConditionalPut};
+use slatedb::Db;
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let r2_store = Arc::new(
+        AmazonS3Builder::new()
+            .with_endpoint("https://<account-id>.r2.cloudflarestorage.com")
+            .with_access_key_id("your-r2-access-key-id")
+            .with_secret_access_key("your-r2-secret-access-key")
+            .with_bucket_name("slatedb")
+            .with_region("auto")
+            .with_conditional_put(S3ConditionalPut::ETagMatch)
+            .build()?
+    );
+
+    let db = Db::open("/tmp/slatedb_r2", r2_store).await?;
+    
+    db.put(b"key", b"value").await?;
+    db.close().await?;
+    
+    Ok(())
+}
+```
+
+## DigitalOcean Spaces
+
+DigitalOcean Spaces is S3-compatible object storage.
+
+### Configure SlateDB for Spaces
+
+```rust
+use object_store::aws::{AmazonS3Builder, S3ConditionalPut};
+use slatedb::Db;
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let spaces_store = Arc::new(
+        AmazonS3Builder::new()
+            .with_endpoint("https://nyc3.digitaloceanspaces.com")
+            .with_access_key_id("your-spaces-key")
+            .with_secret_access_key("your-spaces-secret")
+            .with_bucket_name("slatedb")
+            .with_region("nyc3")
+            .with_conditional_put(S3ConditionalPut::ETagMatch)
+            .build()?
+    );
+
+    let db = Db::open("/tmp/slatedb_spaces", spaces_store).await?;
+    
+    db.put(b"key", b"value").await?;
+    db.close().await?;
+    
+    Ok(())
+}
+```
+
+## Wasabi
+
+Wasabi provides S3-compatible cloud storage.
+
+### Configure SlateDB for Wasabi
+
+```rust
+use object_store::aws::{AmazonS3Builder, S3ConditionalPut};
+use slatedb::Db;
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let wasabi_store = Arc::new(
+        AmazonS3Builder::new()
+            .with_endpoint("https://s3.us-east-1.wasabisys.com")
+            .with_access_key_id("your-wasabi-key")
+            .with_secret_access_key("your-wasabi-secret")
+            .with_bucket_name("slatedb")
+            .with_region("us-east-1")
+            .with_conditional_put(S3ConditionalPut::ETagMatch)
+            .build()?
+    );
+
+    let db = Db::open("/tmp/slatedb_wasabi", wasabi_store).await?;
+    
+    db.put(b"key", b"value").await?;
+    db.close().await?;
+    
+    Ok(())
+}
+```
+
+## Common Configuration Options
+
+### Path-Style Addressing
+
+Some S3-compatible services require path-style URLs:
+
+```rust
+let store = AmazonS3Builder::new()
+    .with_endpoint("http://localhost:9000")
+    .with_bucket_name("slatedb")
+    .with_virtual_hosted_style_request(false)  // Use path-style
+    .with_conditional_put(S3ConditionalPut::ETagMatch)
+    .build()?;
+```
+
+### Custom Client Configuration
+
+```rust
+use object_store::ClientOptions;
+
+let client_options = ClientOptions::new()
+    .with_timeout(std::time::Duration::from_secs(30))
+    .with_connect_timeout(std::time::Duration::from_secs(10));
+
+let store = AmazonS3Builder::new()
+    .with_endpoint("http://localhost:9000")
+    .with_bucket_name("slatedb")
+    .with_client_options(client_options)
+    .with_conditional_put(S3ConditionalPut::ETagMatch)
+    .build()?;
+```
+
+### Retry Configuration
+
+```rust
+use object_store::RetryConfig;
+
+let retry_config = RetryConfig {
+    max_retries: 5,
+    retry_timeout: std::time::Duration::from_secs(60),
+    ..Default::default()
+};
+
+let store = AmazonS3Builder::new()
+    .with_endpoint("http://localhost:9000")
+    .with_bucket_name("slatedb")
+    .with_retry(retry_config)
+    .with_conditional_put(S3ConditionalPut::ETagMatch)
+    .build()?;
+```
+
+## Environment Variables
+
+You can use environment variables with S3-compatible services:
+
+```bash .env
+# MinIO example
+AWS_ENDPOINT=http://localhost:9000
+AWS_ALLOW_HTTP=true
+AWS_ACCESS_KEY_ID=minioadmin
+AWS_SECRET_ACCESS_KEY=minioadmin
+AWS_BUCKET_NAME=slatedb
+AWS_REGION=us-east-1
+
+# Cloudflare R2 example
+AWS_ENDPOINT=https://<account-id>.r2.cloudflarestorage.com
+AWS_ACCESS_KEY_ID=your-r2-key
+AWS_SECRET_ACCESS_KEY=your-r2-secret
+AWS_BUCKET_NAME=slatedb
+AWS_REGION=auto
+```
+
+Then use `from_env()`:
+
+```rust
+let store = Arc::new(
+    AmazonS3Builder::from_env()
+        .with_conditional_put(S3ConditionalPut::ETagMatch)
+        .build()?
+);
+```
+
+## Testing with LocalStack
+
+Create a complete test setup:
+
+```bash docker-compose.yml
+version: '3.8'
+services:
+  localstack:
+    image: localstack/localstack
+    ports:
+      - "4566:4566"
+    environment:
+      - SERVICES=s3
+      - DEBUG=1
+    volumes:
+      - ./init-localstack.sh:/etc/localstack/init/ready.d/init-aws.sh
+```
+
+```bash init-localstack.sh
+#!/bin/bash
+awslocal s3 mb s3://slatedb
+echo "LocalStack initialized with slatedb bucket"
+```
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use object_store::aws::{AmazonS3Builder, S3ConditionalPut};
+    use slatedb::Db;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn test_with_localstack() -> anyhow::Result<()> {
+        let store = Arc::new(
+            AmazonS3Builder::new()
+                .with_endpoint("http://localhost:4566")
+                .with_allow_http(true)
+                .with_access_key_id("test")
+                .with_secret_access_key("test")
+                .with_bucket_name("slatedb")
+                .with_region("us-east-1")
+                .with_conditional_put(S3ConditionalPut::ETagMatch)
+                .build()?
+        );
+
+        let db = Db::open("/tmp/test_db", store).await?;
+        db.put(b"test_key", b"test_value").await?;
+        
+        let value = db.get(b"test_key").await?;
+        assert_eq!(value, Some(b"test_value".to_vec().into()));
+        
+        db.close().await?;
+        Ok(())
+    }
+}
+```
+
+## Troubleshooting
+
+### Connection Refused
+
+Verify the service is running and the endpoint is correct:
+
+```bash
+curl http://localhost:9000/minio/health/live
+```
+
+### SSL Certificate Errors
+
+For self-signed certificates in development, you might need to disable certificate verification (not recommended for production).
+
+### Path-Style vs Virtual-Hosted
+
+If you get 404 errors, try toggling path-style addressing:
+
+```rust
+.with_virtual_hosted_style_request(false)
+```
+
+### ETag Support
+
+Ensure your S3-compatible service supports conditional PUT operations with ETags. Some older or minimal implementations may not support this.
+
+## Performance Considerations
+
+### Local Development
+
+For local development with MinIO or LocalStack:
+- Use SSD storage for better performance
+- Adjust MinIO's memory settings for your workload
+- Consider using MinIO's distributed mode for production-like testing
+
+### Network Configuration
+
+When deploying MinIO:
+- Place storage nodes close to compute
+- Use dedicated network interfaces for storage traffic
+- Configure appropriate MTU sizes
+
+## Security Best Practices
+
+<Warning>
+  Security considerations for S3-compatible storage:
+</Warning>
+
+1. **Use HTTPS**: Always use HTTPS in production (`.with_allow_http(false)`)
+2. **Strong Credentials**: Generate strong access keys
+3. **Network Isolation**: Use private networks or VPNs
+4. **Access Policies**: Configure bucket policies to restrict access
+5. **Audit Logging**: Enable access logs for compliance
+
+### MinIO Security
+
+```bash
+# Create a new user with limited permissions
+mc admin user add local slatedb-user STRONGPASSWORD
+
+# Create a policy
+cat > slatedb-policy.json <<EOF
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"],
+      "Resource": ["arn:aws:s3:::slatedb/*"]
+    }
+  ]
+}
+EOF
+
+# Apply the policy
+mc admin policy create local slatedb-policy slatedb-policy.json
+mc admin policy attach local slatedb-policy --user slatedb-user
+```
+
+## Next Steps
+
+- Learn about [database operations](/guides/basic-operations)
+- Configure [compaction settings](/configuration/compactor)
+- Set up [monitoring](/configuration/settings)
+- Explore [AWS S3](/object-storage/aws-s3) for production deployments

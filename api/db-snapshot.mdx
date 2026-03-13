@@ -1,0 +1,312 @@
+---
+title: DbSnapshot
+description: API reference for SlateDB's DbSnapshot for point-in-time database reads
+---
+
+## Overview
+
+`DbSnapshot` provides a consistent, point-in-time view of the database. It allows you to read data as it existed at the moment the snapshot was created, isolated from any subsequent writes or modifications.
+
+## Structure
+
+```rust
+pub struct DbSnapshot {
+    txn_id: Uuid,
+    started_seq: u64,
+    txn_manager: Arc<TransactionManager>,
+    db_inner: Arc<DbInner>,
+}
+```
+
+### Fields
+
+- `txn_id` - The ID of the transaction that created this snapshot
+- `started_seq` - The sequence number when the snapshot was created
+- `txn_manager` - Reference to the transaction manager
+- `db_inner` - Reference to the database
+
+## Methods
+
+### get
+
+```rust
+pub async fn get<K: AsRef<[u8]> + Send>(
+    &self,
+    key: K
+) -> Result<Option<Bytes>, crate::Error>
+```
+
+Retrieves a value from the snapshot using default read options.
+
+**Parameters:**
+- `key` - The key to retrieve
+
+**Returns:**
+- `Result<Option<Bytes>, crate::Error>` - The value if it exists, `None` otherwise
+
+**Example:**
+
+```rust
+use slatedb::Db;
+
+let db = Db::open("/tmp/my_db", object_store).await?;
+
+// Write some data
+db.put(b"key1", b"value1").await?;
+
+// Create a snapshot
+let snapshot = db.snapshot().await?;
+
+// Modifications after snapshot creation are not visible
+db.put(b"key1", b"modified").await?;
+
+// Snapshot still sees original value
+let value = snapshot.get(b"key1").await?;
+assert_eq!(value, Some(Bytes::from("value1")));
+```
+
+### get_with_options
+
+```rust
+pub async fn get_with_options<K: AsRef<[u8]> + Send>(
+    &self,
+    key: K,
+    options: &ReadOptions
+) -> Result<Option<Bytes>, crate::Error>
+```
+
+Retrieves a value from the snapshot with custom read options.
+
+**Parameters:**
+- `key` - The key to retrieve
+- `options` - Custom read options
+
+**Returns:**
+- `Result<Option<Bytes>, crate::Error>` - The value if it exists, `None` otherwise
+
+### get_key_value
+
+```rust
+pub async fn get_key_value<K: AsRef<[u8]> + Send>(
+    &self,
+    key: K
+) -> Result<Option<KeyValue>, crate::Error>
+```
+
+Retrieves a key-value pair from the snapshot with default read options.
+
+**Parameters:**
+- `key` - The key to retrieve
+
+**Returns:**
+- `Result<Option<KeyValue>, crate::Error>` - The key-value pair if it exists, `None` otherwise
+
+### get_key_value_with_options
+
+```rust
+pub async fn get_key_value_with_options<K: AsRef<[u8]> + Send>(
+    &self,
+    key: K,
+    options: &ReadOptions
+) -> Result<Option<KeyValue>, crate::Error>
+```
+
+Retrieves a key-value pair from the snapshot with custom read options.
+
+**Parameters:**
+- `key` - The key to retrieve
+- `options` - Custom read options
+
+**Returns:**
+- `Result<Option<KeyValue>, crate::Error>` - The key-value pair if it exists, `None` otherwise
+
+### scan
+
+```rust
+pub async fn scan<K, T>(&self, range: T) -> Result<DbIterator, crate::Error>
+where
+    K: AsRef<[u8]> + Send,
+    T: RangeBounds<K> + Send,
+```
+
+Scans a range of keys using default scan options.
+
+**Parameters:**
+- `range` - The range of keys to scan
+
+**Returns:**
+- `Result<DbIterator, crate::Error>` - An iterator with the scan results
+
+**Example:**
+
+```rust
+let db = Db::open("/tmp/my_db", object_store).await?;
+
+db.put(b"key1", b"value1").await?;
+db.put(b"key2", b"value2").await?;
+db.put(b"key3", b"value3").await?;
+
+let snapshot = db.snapshot().await?;
+
+// Write more data after snapshot
+db.put(b"key4", b"value4").await?;
+
+// Snapshot scan only sees keys 1-3
+let mut iter = snapshot.scan(b"key1"..).await?;
+while let Some(kv) = iter.next().await? {
+    println!("{:?}: {:?}", kv.key, kv.value);
+}
+```
+
+### scan_with_options
+
+```rust
+pub async fn scan_with_options<K, T>(
+    &self,
+    range: T,
+    options: &ScanOptions
+) -> Result<DbIterator, crate::Error>
+where
+    K: AsRef<[u8]> + Send,
+    T: RangeBounds<K> + Send,
+```
+
+Scans a range of keys with custom scan options.
+
+**Parameters:**
+- `range` - The range of keys to scan
+- `options` - Custom scan options
+
+**Returns:**
+- `Result<DbIterator, crate::Error>` - An iterator with the scan results
+
+### scan_prefix
+
+```rust
+pub async fn scan_prefix<P>(&self, prefix: P) -> Result<DbIterator, crate::Error>
+where
+    P: AsRef<[u8]> + Send,
+```
+
+Scans all keys that share the provided prefix using default scan options.
+
+**Parameters:**
+- `prefix` - The key prefix to scan
+
+**Returns:**
+- `Result<DbIterator, crate::Error>` - An iterator with the scan results
+
+**Example:**
+
+```rust
+let db = Db::open("/tmp/my_db", object_store).await?;
+
+db.put(b"user:1:name", b"Alice").await?;
+db.put(b"user:1:email", b"alice@example.com").await?;
+db.put(b"user:2:name", b"Bob").await?;
+
+let snapshot = db.snapshot().await?;
+
+// Scan all keys with "user:1:" prefix
+let mut iter = snapshot.scan_prefix(b"user:1:").await?;
+while let Some(kv) = iter.next().await? {
+    println!("{:?}: {:?}", kv.key, kv.value);
+}
+```
+
+### scan_prefix_with_options
+
+```rust
+pub async fn scan_prefix_with_options<P>(
+    &self,
+    prefix: P,
+    options: &ScanOptions
+) -> Result<DbIterator, crate::Error>
+where
+    P: AsRef<[u8]> + Send,
+```
+
+Scans all keys that share the provided prefix with custom scan options.
+
+**Parameters:**
+- `prefix` - The key prefix to scan
+- `options` - Custom scan options
+
+**Returns:**
+- `Result<DbIterator, crate::Error>` - An iterator with the scan results
+
+## Traits
+
+### DbRead
+
+`DbSnapshot` implements the `DbRead` trait, providing a consistent read interface.
+
+### Drop
+
+When a `DbSnapshot` is dropped, it automatically unregisters from the transaction manager, freeing up resources.
+
+## Usage Notes
+
+### Isolation
+
+Snapshots provide isolation from subsequent writes:
+
+```rust
+let db = Db::open("/tmp/my_db", object_store).await?;
+
+db.put(b"key1", b"original").await?;
+
+// Create snapshot at this point
+let snapshot = db.snapshot().await?;
+
+// Modify the database
+db.put(b"key1", b"modified").await?;
+db.delete(b"key2").await?;
+
+// Snapshot sees the original state
+let value = snapshot.get(b"key1").await?;
+assert_eq!(value, Some(Bytes::from("original")));
+```
+
+### Multiple Snapshots
+
+You can create multiple snapshots at different points in time:
+
+```rust
+db.put(b"key1", b"version1").await?;
+let snapshot1 = db.snapshot().await?;
+
+db.put(b"key1", b"version2").await?;
+let snapshot2 = db.snapshot().await?;
+
+db.put(b"key1", b"version3").await?;
+let snapshot3 = db.snapshot().await?;
+
+// Each snapshot sees its respective version
+assert_eq!(snapshot1.get(b"key1").await?, Some(Bytes::from("version1")));
+assert_eq!(snapshot2.get(b"key1").await?, Some(Bytes::from("version2")));
+assert_eq!(snapshot3.get(b"key1").await?, Some(Bytes::from("version3")));
+```
+
+### Snapshots and Flushes
+
+Snapshots remain consistent even when data is flushed to disk:
+
+```rust
+db.put(b"key1", b"value1").await?;
+let snapshot = db.snapshot().await?;
+
+// Flush data and write new values
+db.flush().await?;
+db.put(b"key1", b"modified").await?;
+
+// Snapshot still sees original value
+let value = snapshot.get(b"key1").await?;
+assert_eq!(value, Some(Bytes::from("value1")));
+```
+
+## See Also
+
+- [Db](/api/db) - Create snapshots using `Db::snapshot()`
+- [DbIterator](/api/db-iterator) - Iterate over snapshot scan results
+- [Checkpoint](/api/checkpoint) - Create persistent checkpoints for backup and recovery

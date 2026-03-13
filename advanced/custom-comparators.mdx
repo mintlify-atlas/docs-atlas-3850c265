@@ -1,0 +1,317 @@
+---
+title: Custom Key Ordering
+description: Understanding key ordering and encoding strategies in SlateDB
+---
+
+SlateDB uses **lexicographic (bytewise) ordering** for all keys. This ordering is fundamental to the LSM-tree architecture and affects range queries, compaction, and iterator semantics.
+
+<Note>
+RFC 0016 proposed custom comparators but was **rejected** in favor of key encoding patterns. This document explains why and how to achieve custom ordering through proper key encoding.
+</Note>
+
+## Why Bytewise Ordering Only?
+
+SlateDB intentionally does not expose custom comparators, following industry precedent from systems like FoundationDB, DynamoDB, TiKV, and CockroachDB. This decision was made because:
+
+1. **Reduced complexity**: Custom comparators add significant implementation complexity with dynamic dispatch on hot paths, validation logic, and manifest changes
+2. **Bug potential**: RocksDB and Pebble have experienced bugs and regressions related to custom comparators
+3. **Encoding suffices**: All common use cases can be addressed through proper key encoding
+4. **Data corruption risk**: Changing comparators after deployment can corrupt the database
+
+## Key Encoding Patterns
+
+Instead of custom comparators, encode your keys to sort correctly under bytewise comparison.
+
+### Composite Keys
+
+For multi-part keys, use separators or fixed-length encoding:
+
+```rust
+use bytes::{Bytes, BytesMut, BufMut};
+
+// Option 1: Null-byte separator
+fn encode_composite(user_id: &str, timestamp: u64) -> Bytes {
+    let mut buf = BytesMut::new();
+    buf.put(user_id.as_bytes());
+    buf.put_u8(0x00);  // separator
+    buf.put_u64(timestamp);
+    buf.freeze()
+}
+
+// Option 2: Fixed-length components
+fn encode_fixed(user_id: u32, timestamp: u64) -> Bytes {
+    let mut buf = BytesMut::with_capacity(12);
+    buf.put_u32(user_id);
+    buf.put_u64(timestamp);
+    buf.freeze()
+}
+
+// Usage
+let key = encode_composite("user123", 1234567890);
+db.put(&key, b"value").await?;
+```
+
+### Descending Order
+
+Invert bytes to reverse sort order:
+
+```rust
+// Descending timestamps (newest first)
+fn encode_descending_timestamp(ts: u64) -> Bytes {
+    let mut buf = BytesMut::with_capacity(8);
+    // XOR with max value inverts the order
+    buf.put_u64(u64::MAX - ts);
+    buf.freeze()
+}
+
+// Or flip all bits
+fn flip_bytes(value: u64) -> Bytes {
+    let mut buf = BytesMut::with_capacity(8);
+    buf.put_u64(value ^ u64::MAX);
+    buf.freeze()
+}
+
+// Example: user_id ascending, timestamp descending
+fn encode_user_timeline(user_id: u32, timestamp: u64) -> Bytes {
+    let mut buf = BytesMut::with_capacity(12);
+    buf.put_u32(user_id);                    // ascending
+    buf.put_u64(u64::MAX - timestamp);       // descending
+    buf.freeze()
+}
+```
+
+### Floating Point Numbers
+
+Encode floating point numbers to sort correctly:
+
+```rust
+fn encode_f64(value: f64) -> Bytes {
+    let mut bits = value.to_bits();
+    
+    // Flip sign bit for positive numbers
+    // Flip all bits for negative numbers
+    if value >= 0.0 {
+        bits ^= 0x8000000000000000;
+    } else {
+        bits ^= 0xFFFFFFFFFFFFFFFF;
+    }
+    
+    let mut buf = BytesMut::with_capacity(8);
+    buf.put_u64(bits);
+    buf.freeze()
+}
+
+// Usage
+let key = encode_f64(3.14159);
+db.put(&key, b"pi").await?;
+```
+
+### Geospatial Data
+
+Use space-filling curves like Z-order (Morton encoding) or Hilbert curves:
+
+```rust
+// Simple 2D Morton encoding (Z-order)
+fn morton_encode(x: u32, y: u32) -> u64 {
+    fn split_by(value: u32) -> u64 {
+        let mut x = value as u64;
+        x = (x | (x << 16)) & 0x0000FFFF0000FFFF;
+        x = (x | (x << 8))  & 0x00FF00FF00FF00FF;
+        x = (x | (x << 4))  & 0x0F0F0F0F0F0F0F0F;
+        x = (x | (x << 2))  & 0x3333333333333333;
+        x = (x | (x << 1))  & 0x5555555555555555;
+        x
+    }
+    split_by(x) | (split_by(y) << 1)
+}
+
+fn encode_geo_point(lat: f64, lon: f64) -> Bytes {
+    // Convert lat/lon to integers (scale and offset as needed)
+    let x = ((lon + 180.0) * 1_000_000.0) as u32;
+    let y = ((lat + 90.0) * 1_000_000.0) as u32;
+    
+    let morton = morton_encode(x, y);
+    let mut buf = BytesMut::with_capacity(8);
+    buf.put_u64(morton);
+    buf.freeze()
+}
+```
+
+### Signed Integers
+
+Flip the sign bit to sort correctly:
+
+```rust
+fn encode_i64(value: i64) -> Bytes {
+    let mut buf = BytesMut::with_capacity(8);
+    // Flip the sign bit so negative numbers sort before positive
+    buf.put_u64((value as u64) ^ 0x8000000000000000);
+    buf.freeze()
+}
+
+fn encode_i32(value: i32) -> Bytes {
+    let mut buf = BytesMut::with_capacity(4);
+    buf.put_u32((value as u32) ^ 0x80000000);
+    buf.freeze()
+}
+```
+
+### Variable-Length Strings
+
+For prefix queries on variable-length strings:
+
+```rust
+// Strings already sort correctly under bytewise comparison
+fn encode_string(s: &str) -> Bytes {
+    Bytes::copy_from_slice(s.as_bytes())
+}
+
+// For case-insensitive sorting, lowercase first
+fn encode_case_insensitive(s: &str) -> Bytes {
+    Bytes::from(s.to_lowercase())
+}
+
+// Prefix scan example
+let prefix = "user:";
+let start = Bytes::from(prefix);
+let end = Bytes::from(format!("{}\xff", prefix));
+
+let mut iter = db.scan(start..end).await?;
+while let Some((key, value)) = iter.next().await? {
+    // All keys starting with "user:" prefix
+}
+```
+
+## Using Key Encoding Libraries
+
+Consider using existing key encoding libraries:
+
+### storekey
+
+[storekey](https://github.com/surrealdb/storekey) provides tuple-like key encoding:
+
+```rust
+use storekey::serialize;
+
+// Encode a tuple of values
+let key = serialize(&("user", 12345u64, "profile"))?;
+db.put(&key, b"value").await?;
+
+// Supports multiple types with correct ordering
+let key1 = serialize(&("users", 100u32))?;
+let key2 = serialize(&("users", 200u32))?;
+assert!(key1 < key2);
+```
+
+### ordered-float
+
+For floating-point keys:
+
+```rust
+use ordered_float::OrderedFloat;
+
+fn encode_ordered_float(value: f64) -> Bytes {
+    let ordered = OrderedFloat(value);
+    Bytes::from(ordered.to_be_bytes().to_vec())
+}
+```
+
+## Complete Example: Time-Series Data
+
+Here's a complete example for time-series data with descending timestamps:
+
+```rust
+use bytes::{Bytes, BytesMut, BufMut};
+use slatedb::{Db, Error};
+
+#[derive(Debug)]
+struct TimeSeriesKey {
+    metric: String,
+    timestamp: u64,
+    tag: String,
+}
+
+impl TimeSeriesKey {
+    fn encode(&self) -> Bytes {
+        let mut buf = BytesMut::new();
+        
+        // Metric name (ascending)
+        buf.put(self.metric.as_bytes());
+        buf.put_u8(0x00);
+        
+        // Timestamp (descending - newest first)
+        buf.put_u64(u64::MAX - self.timestamp);
+        buf.put_u8(0x00);
+        
+        // Tag (ascending)
+        buf.put(self.tag.as_bytes());
+        
+        buf.freeze()
+    }
+    
+    fn decode(bytes: &[u8]) -> Result<Self, Error> {
+        let parts: Vec<&[u8]> = bytes.split(|&b| b == 0x00).collect();
+        if parts.len() != 3 {
+            return Err(Error::from(slatedb::SlateDBError::InvalidArgument(
+                "Invalid key format".into()
+            )));
+        }
+        
+        Ok(TimeSeriesKey {
+            metric: String::from_utf8_lossy(parts[0]).to_string(),
+            timestamp: u64::MAX - u64::from_be_bytes(parts[1].try_into().unwrap()),
+            tag: String::from_utf8_lossy(parts[2]).to_string(),
+        })
+    }
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Error> {
+    let object_store = slatedb::object_store::memory::InMemory::new();
+    let db = Db::builder("/tmp/timeseries", object_store)
+        .build()
+        .await?;
+    
+    // Write data
+    let key = TimeSeriesKey {
+        metric: "cpu.usage".to_string(),
+        timestamp: 1234567890,
+        tag: "host1".to_string(),
+    };
+    db.put(&key.encode(), b"95.5").await?;
+    
+    // Range scan: all "cpu.usage" metrics (newest first)
+    let start = TimeSeriesKey {
+        metric: "cpu.usage".to_string(),
+        timestamp: u64::MAX,  // Start from newest
+        tag: String::new(),
+    };
+    let end = TimeSeriesKey {
+        metric: "cpu.usage".to_string(),
+        timestamp: 0,  // End at oldest
+        tag: "\xff".to_string(),
+    };
+    
+    let mut iter = db.scan(start.encode()..end.encode()).await?;
+    while let Some((key, value)) = iter.next().await? {
+        let ts_key = TimeSeriesKey::decode(&key)?;
+        println!("{:?}: {:?}", ts_key, value);
+    }
+    
+    Ok(())
+}
+```
+
+## Best Practices
+
+1. **Document your encoding**: Always document your key encoding scheme
+2. **Version your schema**: Include a version byte if the encoding might change
+3. **Use libraries**: Consider using `storekey` or similar libraries for complex keys
+4. **Test ordering**: Write tests to verify your keys sort as expected
+5. **Be consistent**: Use the same encoding throughout your application
+
+## Related Documentation
+
+- [RFC 0016: Custom Comparators](https://github.com/slatedb/slatedb/blob/main/rfcs/0016-custom-comparators.md) - Why this RFC was rejected
+- [Range Queries](/guides/range-queries) - Using encoded keys with scans
+- [Basic Operations](/guides/basic-operations) - Key-value operations

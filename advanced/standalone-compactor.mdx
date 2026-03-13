@@ -1,0 +1,416 @@
+---
+title: Standalone Compactor
+description: Run compaction in a separate process for improved scalability and resource isolation
+---
+
+SlateDB supports running compaction in a separate process from the main database. This architecture provides better resource isolation, independent scaling, and allows you to dedicate hardware specifically for compaction workloads.
+
+## Architecture
+
+SlateDB's compaction can run in two modes:
+
+**Embedded Mode** (default):
+- Compaction runs in the same process as the database writer
+- Simpler deployment and configuration
+- Suitable for most use cases
+
+**Standalone Mode**:
+- Compaction runs in a separate process
+- Writer process focuses only on writes and WAL management
+- Compactor process handles all compaction work
+- Better resource isolation and independent scaling
+
+```
+┌──────────────────┐         ┌──────────────────┐
+│  Writer Process  │         │ Compactor Process│
+│                  │         │                  │
+│  • Writes        │         │  • Compaction    │
+│  • WAL           │         │  • SST merging   │
+│  • Memtable      │         │  • Manifest      │
+│  • L0 flush      │         │    updates       │
+└────────┬─────────┘         └────────┬─────────┘
+         │                            │
+         └────────────┬───────────────┘
+                      │
+              ┌───────▼────────┐
+              │  Object Store  │
+              │   (S3/GCS/etc) │
+              └────────────────┘
+```
+
+## When to Use Standalone Compaction
+
+Consider running a standalone compactor when:
+
+1. **High write throughput**: Your write workload is CPU or I/O intensive and compaction competes for resources
+2. **Independent scaling**: You want to scale write and compaction capacity independently
+3. **Resource isolation**: You want to isolate compaction resource usage (CPU, memory, network)
+4. **Dedicated hardware**: You have different hardware optimized for writes vs. compaction
+5. **Cost optimization**: You want to run compaction on cheaper instances or spot instances
+
+## Setting Up a Standalone Compactor
+
+### 1. Disable Embedded Compaction
+
+First, configure the writer database to disable embedded compaction:
+
+```rust
+use slatedb::{Db, config::Settings};
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let object_store = Arc::new(/* your object store */);
+    
+    let mut settings = Settings::default();
+    // Disable embedded compaction
+    settings.compactor_options = None;
+    
+    let db = Db::builder("/tmp/mydb", object_store)
+        .with_settings(settings)
+        .build()
+        .await?;
+    
+    // Database now handles writes but not compaction
+    db.put(b"key", b"value").await?;
+    
+    Ok(())
+}
+```
+
+### 2. Run the Standalone Compactor
+
+Create a separate process to run compaction:
+
+```rust
+use slatedb::CompactorBuilder;
+use slatedb::object_store::local::LocalFileSystem;
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Same object store configuration as the writer
+    let object_store = Arc::new(/* your object store */);
+    
+    // Build the compactor (no Db instance needed)
+    let compactor = Arc::new(
+        CompactorBuilder::new("/tmp/mydb", object_store)
+            .build()
+    );
+    
+    // Spawn compactor task
+    let compactor_task = {
+        let compactor = Arc::clone(&compactor);
+        tokio::spawn(async move {
+            compactor.run().await
+        })
+    };
+    
+    println!("Compactor running. Press Ctrl-C to stop.");
+    
+    // Wait for shutdown signal
+    tokio::signal::ctrl_c().await?;
+    
+    // Gracefully shutdown
+    compactor.stop().await?;
+    compactor_task.await??;
+    
+    println!("Compactor stopped.");
+    Ok(())
+}
+```
+
+### 3. Complete Example
+
+Here's a complete example with both writer and compactor:
+
+```rust examples/standalone_compactor.rs
+use slatedb::object_store::local::LocalFileSystem;
+use slatedb::CompactorBuilder;
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let local_root = std::env::temp_dir().join("slatedb-standalone-compactor-tutorial");
+    std::fs::create_dir_all(&local_root)?;
+    let object_store = Arc::new(LocalFileSystem::new_with_prefix(local_root)?);
+
+    // Build a compactor without opening a Db. The database must already exist (i.e.
+    // the manifest has been created).
+    let compactor = Arc::new(CompactorBuilder::new("db", object_store).build());
+
+    let compactor_task = {
+        let compactor = Arc::clone(&compactor);
+        tokio::spawn(async move { compactor.run().await })
+    };
+
+    println!("Compactor running. Press Ctrl-C to stop.");
+    tokio::signal::ctrl_c().await?;
+
+    compactor.stop().await?;
+    compactor_task.await??;
+
+    Ok(())
+}
+```
+
+## Configuration
+
+### Compactor Options
+
+Configure the compactor using `CompactorOptions`:
+
+```rust
+use slatedb::config::CompactorOptions;
+use std::time::Duration;
+
+let options = CompactorOptions {
+    // How often to check for new compaction work
+    poll_interval: Duration::from_secs(5),
+    
+    // Timeout for manifest updates
+    manifest_update_timeout: Duration::from_secs(300),
+    
+    // Maximum size of output SSTs
+    max_sst_size: 256 * 1024 * 1024,  // 256 MiB
+    
+    // Number of concurrent compaction jobs
+    max_concurrent_compactions: 4,
+    
+    // Scheduler-specific options (e.g., size-tiered parameters)
+    scheduler_options: Default::default(),
+};
+
+let compactor = CompactorBuilder::new("/tmp/mydb", object_store)
+    .with_options(options)
+    .build();
+```
+
+### Custom Runtime
+
+Use a dedicated Tokio runtime for the compactor:
+
+```rust
+let compaction_runtime = tokio::runtime::Builder::new_multi_thread()
+    .worker_threads(4)
+    .thread_name("compaction")
+    .enable_all()
+    .build()?;
+
+let compactor = CompactorBuilder::new("/tmp/mydb", object_store)
+    .with_runtime(compaction_runtime.handle().clone())
+    .build();
+```
+
+### Compaction Filters
+
+If using compaction filters, configure them on both the writer and compactor:
+
+```rust
+use slatedb::{CompactionFilterSupplier};
+use std::sync::Arc;
+
+// Ensure the same filter supplier is used
+let filter_supplier = Arc::new(MyFilterSupplier);
+
+// On writer (if using embedded + standalone mode)
+let db = Db::builder(path, object_store.clone())
+    .with_compaction_filter_supplier(filter_supplier.clone())
+    .build()
+    .await?;
+
+// On standalone compactor
+let compactor = CompactorBuilder::new(path, object_store)
+    .with_compaction_filter_supplier(filter_supplier)
+    .build();
+```
+
+## Deployment Patterns
+
+### Single Compactor
+
+One dedicated compactor process:
+
+```yaml
+# docker-compose.yml
+version: '3.8'
+services:
+  writer:
+    image: myapp:latest
+    environment:
+      - SLATEDB_COMPACTOR_OPTIONS=null  # Disable embedded compaction
+    deploy:
+      replicas: 3
+  
+  compactor:
+    image: myapp-compactor:latest
+    command: standalone-compactor
+    deploy:
+      replicas: 1  # Single compactor
+```
+
+### Multiple Compactors
+
+Run multiple compactors for higher throughput (SlateDB coordinates via manifest):
+
+```yaml
+services:
+  compactor:
+    image: myapp-compactor:latest
+    deploy:
+      replicas: 3  # Multiple compactors coordinate automatically
+```
+
+### Kubernetes Deployment
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: slatedb-compactor
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: slatedb-compactor
+  template:
+    metadata:
+      labels:
+        app: slatedb-compactor
+    spec:
+      containers:
+      - name: compactor
+        image: myapp-compactor:latest
+        resources:
+          requests:
+            memory: "2Gi"
+            cpu: "1000m"
+          limits:
+            memory: "4Gi"
+            cpu: "2000m"
+        env:
+        - name: SLATEDB_PATH
+          value: "/data/mydb"
+        - name: S3_BUCKET
+          value: "my-slatedb-bucket"
+```
+
+## Monitoring
+
+### Health Checks
+
+Monitor compactor health:
+
+```rust
+use slatedb::CompactorBuilder;
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let compactor = Arc::new(
+        CompactorBuilder::new("/tmp/mydb", object_store)
+            .build()
+    );
+    
+    // Start compactor
+    let compactor_handle = {
+        let c = Arc::clone(&compactor);
+        tokio::spawn(async move { c.run().await })
+    };
+    
+    // Monitor compactor status
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            // Check if compactor is running
+            if compactor_handle.is_finished() {
+                eprintln!("Compactor stopped unexpectedly!");
+                break;
+            }
+        }
+    });
+    
+    Ok(())
+}
+```
+
+### Metrics
+
+Monitor compaction metrics:
+
+```rust
+use slatedb::stats::StatRegistry;
+use std::sync::Arc;
+
+let stat_registry = Arc::new(StatRegistry::new());
+
+let compactor = CompactorBuilder::new("/tmp/mydb", object_store)
+    .with_stat_registry(stat_registry.clone())
+    .build();
+
+// Export metrics periodically
+tokio::spawn(async move {
+    loop {
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        // Export metrics to your monitoring system
+        // e.g., Prometheus, CloudWatch, etc.
+    }
+});
+```
+
+## Troubleshooting
+
+### Compactor Not Starting
+
+Ensure the database manifest exists:
+
+```rust
+// Create the database first (with writer)
+let db = Db::builder("/tmp/mydb", object_store)
+    .build()
+    .await?;
+
+// Now standalone compactor can start
+let compactor = CompactorBuilder::new("/tmp/mydb", object_store)
+    .build();
+```
+
+### Multiple Compactors Conflict
+
+SlateDB automatically coordinates multiple compactors. If you see manifest update conflicts:
+
+1. Increase `manifest_update_timeout`
+2. Reduce `max_concurrent_compactions` per compactor
+3. Ensure object store has strong consistency (required for S3)
+
+### Resource Exhaustion
+
+If the compactor runs out of memory or CPU:
+
+```rust
+let options = CompactorOptions {
+    // Reduce concurrent compactions
+    max_concurrent_compactions: 2,
+    
+    // Smaller SST output size
+    max_sst_size: 128 * 1024 * 1024,
+    
+    ..Default::default()
+};
+```
+
+## Best Practices
+
+1. **Start simple**: Begin with embedded compaction, move to standalone only if needed
+2. **Monitor first**: Ensure you have good visibility into compaction metrics before deploying standalone
+3. **Same configuration**: Use identical configuration for filters, merge operators, and block transformers across writer and compactor
+4. **Graceful shutdown**: Always call `compactor.stop()` before terminating
+5. **Resource allocation**: Allocate sufficient CPU and memory for compaction workloads
+6. **Network bandwidth**: Ensure sufficient bandwidth between compactor and object store
+
+## Related Documentation
+
+- [Compaction Filters](/advanced/compaction-filters) - Custom compaction logic
+- [Performance Tuning](/advanced/performance-tuning) - Optimize compaction performance
+- [Compactor Configuration](/configuration/compactor) - Compaction settings
+- [Configuration Settings](/configuration/settings) - Complete configuration reference

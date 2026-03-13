@@ -1,0 +1,490 @@
+---
+title: Change Data Capture
+description: Stream database changes in real-time with SlateDB's WAL-based CDC
+---
+
+Change Data Capture (CDC) allows you to stream all changes to your database in real-time. SlateDB provides CDC through its Write-Ahead Log (WAL), enabling use cases like replication, event sourcing, and change notifications.
+
+## Understanding CDC in SlateDB
+
+SlateDB writes all changes to a Write-Ahead Log (WAL) before applying them to the database. CDC works by:
+1. Reading WAL files from object storage
+2. Iterating over change records
+3. Emitting events for puts, merges, and deletes
+4. Tracking your position with a cursor
+
+## Basic CDC Implementation
+
+Here's a complete example of implementing CDC:
+
+```rust
+use slatedb::config::{FlushOptions, FlushType};
+use slatedb::object_store::memory::InMemory;
+use slatedb::{Db, RowEntry, ValueDeletable, WalFile, WalReader};
+use std::sync::Arc;
+
+#[derive(Debug, Default)]
+struct CdcCursor {
+    wal_id: u64,
+    last_seq: u64,
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let object_store = Arc::new(InMemory::new());
+    let path = "/change-data-capture-example";
+
+    let db = Db::open(path, object_store.clone()).await?;
+    
+    // Write some changes
+    db.put(b"user:1", b"alice").await?;
+    db.put(b"user:2", b"bob").await?;
+    db.delete(b"user:2").await?;
+    
+    // Flush to ensure WAL is written
+    db.flush_with_options(FlushOptions {
+        flush_type: FlushType::Wal,
+    })
+    .await?;
+
+    // Create CDC reader
+    let wal_reader = WalReader::new(path, object_store);
+    let mut cursor = CdcCursor::default();
+
+    // Process changes
+    for wal_file in wal_reader.list(cursor.wal_id..).await? {
+        emit_wal_file(&wal_file, &mut cursor).await?;
+    }
+
+    db.close().await?;
+    Ok(())
+}
+
+async fn emit_wal_file(
+    wal_file: &WalFile,
+    cursor: &mut CdcCursor,
+) -> anyhow::Result<()> {
+    let mut iter = wal_file.iterator().await?;
+    
+    while let Some(row) = iter.next().await? {
+        // Skip already processed entries
+        if wal_file.id == cursor.wal_id && row.seq <= cursor.last_seq {
+            continue;
+        }
+
+        emit_row(wal_file.id, &row);
+        
+        // Update cursor
+        cursor.wal_id = wal_file.id;
+        cursor.last_seq = row.seq;
+    }
+
+    Ok(())
+}
+
+fn emit_row(wal_id: u64, row: &RowEntry) {
+    let key = String::from_utf8_lossy(row.key.as_ref());
+    
+    match &row.value {
+        ValueDeletable::Value(value) => {
+            let value = String::from_utf8_lossy(value.as_ref());
+            println!("wal_id={wal_id} seq={} upsert {key}={value}", row.seq);
+        }
+        ValueDeletable::Merge(value) => {
+            let value = String::from_utf8_lossy(value.as_ref());
+            println!("wal_id={wal_id} seq={} merge {key}+={value}", row.seq);
+        }
+        ValueDeletable::Tombstone => {
+            println!("wal_id={wal_id} seq={} delete {key}", row.seq);
+        }
+    }
+}
+```
+
+## CDC Components
+
+### WalReader
+
+The `WalReader` provides access to WAL files:
+
+```rust
+use slatedb::WalReader;
+
+let wal_reader = WalReader::new(path, object_store);
+
+// List all WAL files starting from a specific ID
+let wal_files = wal_reader.list(start_wal_id..).await?;
+
+// Get a specific WAL file by ID
+let wal_file = wal_reader.get(wal_id);
+```
+
+### WAL Files
+
+Each WAL file contains a sequence of change records:
+
+```rust
+// Iterate through changes in a WAL file
+let mut iter = wal_file.iterator().await?;
+while let Some(row) = iter.next().await? {
+    // Process row
+    println!("Key: {:?}, Seq: {}", row.key, row.seq);
+}
+```
+
+### Change Records
+
+Each change record (`RowEntry`) contains:
+
+```rust
+struct RowEntry {
+    key: Bytes,              // The key that changed
+    value: ValueDeletable,   // The change type and value
+    seq: u64,                // Sequence number
+    create_ts: Option<i64>,  // Creation timestamp
+    expire_ts: Option<i64>,  // Expiration timestamp
+}
+
+enum ValueDeletable {
+    Value(Bytes),     // Put operation
+    Merge(Bytes),     // Merge operation
+    Tombstone,        // Delete operation
+}
+```
+
+## Cursor Management
+
+### Implementing a Cursor
+
+A cursor tracks your position in the change stream:
+
+```rust
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CdcCursor {
+    wal_id: u64,    // Current WAL file ID
+    last_seq: u64,  // Last processed sequence number
+}
+
+impl CdcCursor {
+    fn new() -> Self {
+        Self {
+            wal_id: 0,
+            last_seq: 0,
+        }
+    }
+    
+    fn update(&mut self, wal_id: u64, seq: u64) {
+        self.wal_id = wal_id;
+        self.last_seq = seq;
+    }
+}
+```
+
+### Persisting the Cursor
+
+Persist your cursor to resume from the last position:
+
+```rust
+use serde::{Deserialize, Serialize};
+use std::fs;
+
+fn save_cursor(cursor: &CdcCursor) -> anyhow::Result<()> {
+    let json = serde_json::to_string(cursor)?;
+    fs::write("cdc_cursor.json", json)?;
+    Ok(())
+}
+
+fn load_cursor() -> anyhow::Result<CdcCursor> {
+    let json = fs::read_to_string("cdc_cursor.json")?;
+    let cursor = serde_json::from_str(&json)?;
+    Ok(cursor)
+}
+
+// Usage
+let mut cursor = load_cursor().unwrap_or_default();
+
+// Process changes...
+for wal_file in wal_reader.list(cursor.wal_id..).await? {
+    emit_wal_file(&wal_file, &mut cursor).await?;
+    save_cursor(&cursor)?;  // Persist after each WAL file
+}
+```
+
+## CDC Patterns
+
+### Discovery Pattern (Initial Load)
+
+Use `list()` once to discover all existing WAL files:
+
+```rust
+// Initial discovery - use once
+for wal_file in wal_reader.list(cursor.wal_id..).await? {
+    process_wal_file(&wal_file, &mut cursor).await?;
+}
+```
+
+<Tip>
+Use `list()` for initial discovery or after a long outage. It scans all WAL files but is expensive for polling.
+</Tip>
+
+### Polling Pattern (Continuous)
+
+Poll for new WAL files by ID to avoid repeated full listings:
+
+```rust
+loop {
+    // Check for next WAL file
+    let next_file = wal_reader.get(cursor.wal_id + 1);
+    
+    if let Ok(wal_file) = next_file {
+        process_wal_file(&wal_file, &mut cursor).await?;
+        save_cursor(&cursor)?;
+    } else {
+        // No new WAL file, wait and retry
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+```
+
+<Tip>
+Poll by ID to avoid expensive prefix listings. Only use `list()` when resuming after downtime.
+</Tip>
+
+## Complete CDC Service
+
+Here's a production-ready CDC service implementation:
+
+```rust
+use slatedb::{WalReader, WalFile, RowEntry, ValueDeletable};
+use tokio::time::{interval, Duration};
+use std::sync::Arc;
+
+struct CdcService {
+    wal_reader: WalReader,
+    cursor: CdcCursor,
+    handlers: Vec<Box<dyn ChangeHandler>>,
+}
+
+trait ChangeHandler: Send + Sync {
+    async fn on_put(&self, key: &[u8], value: &[u8], seq: u64) -> anyhow::Result<()>;
+    async fn on_merge(&self, key: &[u8], operand: &[u8], seq: u64) -> anyhow::Result<()>;
+    async fn on_delete(&self, key: &[u8], seq: u64) -> anyhow::Result<()>;
+}
+
+impl CdcService {
+    fn new(path: &str, object_store: Arc<dyn ObjectStore>) -> Self {
+        Self {
+            wal_reader: WalReader::new(path, object_store),
+            cursor: CdcCursor::new(),
+            handlers: Vec::new(),
+        }
+    }
+    
+    fn add_handler(&mut self, handler: Box<dyn ChangeHandler>) {
+        self.handlers.push(handler);
+    }
+    
+    async fn run(&mut self) -> anyhow::Result<()> {
+        let mut ticker = interval(Duration::from_secs(1));
+        
+        loop {
+            ticker.tick().await;
+            
+            // Try to get next WAL file
+            match self.wal_reader.get(self.cursor.wal_id + 1) {
+                Ok(wal_file) => {
+                    self.process_wal_file(&wal_file).await?;
+                }
+                Err(_) => {
+                    // No new WAL file yet
+                    continue;
+                }
+            }
+        }
+    }
+    
+    async fn process_wal_file(&mut self, wal_file: &WalFile) -> anyhow::Result<()> {
+        let mut iter = wal_file.iterator().await?;
+        
+        while let Some(row) = iter.next().await? {
+            if wal_file.id == self.cursor.wal_id && row.seq <= self.cursor.last_seq {
+                continue;
+            }
+            
+            self.emit_change(&row).await?;
+            
+            self.cursor.wal_id = wal_file.id;
+            self.cursor.last_seq = row.seq;
+        }
+        
+        Ok(())
+    }
+    
+    async fn emit_change(&self, row: &RowEntry) -> anyhow::Result<()> {
+        for handler in &self.handlers {
+            match &row.value {
+                ValueDeletable::Value(value) => {
+                    handler.on_put(&row.key, value, row.seq).await?;
+                }
+                ValueDeletable::Merge(operand) => {
+                    handler.on_merge(&row.key, operand, row.seq).await?;
+                }
+                ValueDeletable::Tombstone => {
+                    handler.on_delete(&row.key, row.seq).await?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+// Example handler
+struct LoggingHandler;
+
+impl ChangeHandler for LoggingHandler {
+    async fn on_put(&self, key: &[u8], value: &[u8], seq: u64) -> anyhow::Result<()> {
+        println!("PUT seq={} key={:?} value={:?}", seq, key, value);
+        Ok(())
+    }
+    
+    async fn on_merge(&self, key: &[u8], operand: &[u8], seq: u64) -> anyhow::Result<()> {
+        println!("MERGE seq={} key={:?} operand={:?}", seq, key, operand);
+        Ok(())
+    }
+    
+    async fn on_delete(&self, key: &[u8], seq: u64) -> anyhow::Result<()> {
+        println!("DELETE seq={} key={:?}", seq, key);
+        Ok(())
+    }
+}
+
+// Usage
+let mut cdc = CdcService::new(path, object_store);
+cdc.add_handler(Box::new(LoggingHandler));
+cdc.run().await?;
+```
+
+## Use Cases
+
+### Database Replication
+
+```rust
+struct ReplicationHandler {
+    replica_db: Db,
+}
+
+impl ChangeHandler for ReplicationHandler {
+    async fn on_put(&self, key: &[u8], value: &[u8], _seq: u64) -> anyhow::Result<()> {
+        self.replica_db.put(key, value).await?;
+        Ok(())
+    }
+    
+    async fn on_delete(&self, key: &[u8], _seq: u64) -> anyhow::Result<()> {
+        self.replica_db.delete(key).await?;
+        Ok(())
+    }
+    
+    async fn on_merge(&self, key: &[u8], operand: &[u8], _seq: u64) -> anyhow::Result<()> {
+        self.replica_db.merge(key, operand).await?;
+        Ok(())
+    }
+}
+```
+
+### Event Sourcing
+
+```rust
+struct EventPublisher {
+    event_bus: Arc<EventBus>,
+}
+
+impl ChangeHandler for EventPublisher {
+    async fn on_put(&self, key: &[u8], value: &[u8], seq: u64) -> anyhow::Result<()> {
+        let event = Event {
+            event_type: "PUT".to_string(),
+            key: key.to_vec(),
+            value: Some(value.to_vec()),
+            seq,
+            timestamp: chrono::Utc::now(),
+        };
+        self.event_bus.publish(event).await?;
+        Ok(())
+    }
+    
+    // ... other methods
+}
+```
+
+### Search Index Synchronization
+
+```rust
+struct SearchIndexer {
+    search_client: SearchClient,
+}
+
+impl ChangeHandler for SearchIndexer {
+    async fn on_put(&self, key: &[u8], value: &[u8], _seq: u64) -> anyhow::Result<()> {
+        let doc = parse_document(key, value)?;
+        self.search_client.index(doc).await?;
+        Ok(())
+    }
+    
+    async fn on_delete(&self, key: &[u8], _seq: u64) -> anyhow::Result<()> {
+        self.search_client.delete(key).await?;
+        Ok(())
+    }
+    
+    async fn on_merge(&self, _key: &[u8], _operand: &[u8], _seq: u64) -> anyhow::Result<()> {
+        // Handle merge if needed
+        Ok(())
+    }
+}
+```
+
+## Best Practices
+
+<Tip>
+**Persist cursor frequently**: Save your cursor after processing each WAL file to avoid reprocessing.
+</Tip>
+
+<Tip>
+**Use polling for continuous CDC**: After initial discovery with `list()`, poll by ID to avoid expensive listings.
+</Tip>
+
+<Tip>
+**Handle idempotency**: Changes may be replayed if your service crashes. Ensure handlers are idempotent.
+</Tip>
+
+<Warning>
+**WAL retention**: Old WAL files are eventually garbage collected. Ensure your CDC service keeps up or implement catch-up logic.
+</Warning>
+
+## Error Handling
+
+```rust
+async fn process_with_retry(
+    wal_file: &WalFile,
+    cursor: &mut CdcCursor,
+    max_retries: usize,
+) -> anyhow::Result<()> {
+    let mut retries = 0;
+    
+    loop {
+        match emit_wal_file(wal_file, cursor).await {
+            Ok(_) => return Ok(()),
+            Err(e) if retries < max_retries => {
+                retries += 1;
+                eprintln!("Error processing WAL file: {}, retry {}/{}", e, retries, max_retries);
+                tokio::time::sleep(Duration::from_secs(1 << retries)).await;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+```
+
+## Next Steps
+
+- Learn about [Merge Operators](/guides/merge-operator) to understand merge changes
+- Explore [Transactions](/guides/transactions) for atomic change groups
+- Understand [Checkpoints](/guides/checkpoints) for CDC starting points

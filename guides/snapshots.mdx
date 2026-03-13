@@ -1,0 +1,364 @@
+---
+title: Snapshots
+description: Create point-in-time views of your database with SlateDB snapshots
+---
+
+Snapshots provide a consistent, read-only view of the database at a specific point in time. They're perfect for analytics queries, backups, and ensuring consistent reads while the database continues to accept writes.
+
+## Understanding Snapshots
+
+A snapshot captures the state of the database at the moment it's created. After creation:
+- The snapshot sees the original data, even if keys are modified or deleted
+- The main database can continue accepting writes
+- Multiple snapshots can coexist
+- Snapshots are lightweight and efficient
+
+## Creating Snapshots
+
+### Basic Snapshot Creation
+
+```rust
+use slatedb::{Db, Error};
+use slatedb::object_store::memory::InMemory;
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> Result<(), Error> {
+    let object_store = Arc::new(InMemory::new());
+    let db = Db::open("my_db", object_store).await?;
+
+    // Write some initial data
+    db.put(b"key1", b"original_value").await?;
+
+    // Create a snapshot
+    let snapshot = db.snapshot().await?;
+    println!("Snapshot created successfully");
+
+    Ok(())
+}
+```
+
+### When to Use Snapshots
+
+<Steps>
+
+<Step title="Analytics Queries">
+Run long analytics queries without blocking writes or seeing inconsistent data.
+
+```rust
+let snapshot = db.snapshot().await?;
+
+// Long-running analytics - sees consistent data
+let mut iter = snapshot.scan::<Vec<u8>, _>(..).await?;
+let mut count = 0;
+while let Some(_) = iter.next().await? {
+    count += 1;
+}
+println!("Total keys: {}", count);
+```
+</Step>
+
+<Step title="Consistent Backups">
+Create backups with a consistent view across all keys.
+
+```rust
+let snapshot = db.snapshot().await?;
+
+// Export all data from the snapshot
+let mut backup = Vec::new();
+let mut iter = snapshot.scan::<Vec<u8>, _>(..).await?;
+while let Some(kv) = iter.next().await? {
+    backup.push((kv.key.to_vec(), kv.value.to_vec()));
+}
+```
+</Step>
+
+<Step title="Point-in-Time Reads">
+Read data as it existed at a specific moment while writes continue.
+
+```rust
+// Capture state before a batch operation
+let before_snapshot = db.snapshot().await?;
+
+// Perform batch writes
+db.put(b"key1", b"new_value").await?;
+db.put(b"key2", b"new_value").await?;
+
+// Compare before and after
+let before = before_snapshot.get(b"key1").await?;
+let after = db.get(b"key1").await?;
+```
+</Step>
+
+</Steps>
+
+## Reading from Snapshots
+
+Snapshots support the same read operations as the main database:
+
+### Get Operations
+
+```rust
+let snapshot = db.snapshot().await?;
+
+// Simple get
+if let Some(value) = snapshot.get(b"key").await? {
+    println!("Value: {:?}", value);
+}
+
+// Get with metadata
+if let Some(kv) = snapshot.get_key_value(b"key").await? {
+    println!("Seq: {}, Created: {:?}", kv.seq, kv.create_ts);
+}
+```
+
+### Scanning Ranges
+
+```rust
+let snapshot = db.snapshot().await?;
+
+// Unbounded scan
+let mut iter = snapshot.scan::<Vec<u8>, _>(..).await?;
+
+// Bounded range
+let mut iter = snapshot.scan(b"a".to_vec()..b"z".to_vec()).await?;
+
+// Prefix scan
+let mut iter = snapshot.scan_prefix(b"user:").await?;
+```
+
+## Snapshot Isolation Example
+
+This example demonstrates how snapshots provide isolation from concurrent writes:
+
+```rust
+use slatedb::{Db, Error};
+use slatedb::object_store::memory::InMemory;
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> Result<(), Error> {
+    let object_store = Arc::new(InMemory::new());
+    let db = Db::open("my_db", object_store).await?;
+
+    // Write initial data
+    db.put(b"key1", b"original_value").await?;
+    db.put(b"key2", b"data_before_snapshot").await?;
+
+    // Create a snapshot
+    let snapshot = db.snapshot().await?;
+    println!("Snapshot created");
+
+    // Modify the database after creating snapshot
+    db.put(b"key1", b"modified_value").await?;
+    db.delete(b"key2").await?;
+    db.put(b"key3", b"new_key_after_snapshot").await?;
+
+    // Snapshot sees original data
+    let snap_val1 = snapshot.get(b"key1").await?;
+    println!("Snapshot key1: {:?}", 
+        snap_val1.map(|v| String::from_utf8_lossy(&v).to_string())
+    );
+    // Output: Some("original_value")
+
+    let snap_val2 = snapshot.get(b"key2").await?;
+    println!("Snapshot key2: {:?}",
+        snap_val2.map(|v| String::from_utf8_lossy(&v).to_string())
+    );
+    // Output: Some("data_before_snapshot")
+
+    let snap_val3 = snapshot.get(b"key3").await?;
+    println!("Snapshot key3: {:?}", snap_val3);
+    // Output: None (key didn't exist when snapshot was created)
+
+    // Database sees new data
+    let db_val1 = db.get(b"key1").await?;
+    println!("Database key1: {:?}",
+        db_val1.map(|v| String::from_utf8_lossy(&v).to_string())
+    );
+    // Output: Some("modified_value")
+
+    db.close().await?;
+    Ok(())
+}
+```
+
+## Scanning Snapshot Example
+
+Comparing snapshot and database views during iteration:
+
+```rust
+use slatedb::{Db, Error};
+use slatedb::object_store::memory::InMemory;
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> Result<(), Error> {
+    let object_store = Arc::new(InMemory::new());
+    let db = Db::open("my_db", object_store).await?;
+
+    // Initial data
+    db.put(b"apple", b"red").await?;
+    db.put(b"banana", b"yellow").await?;
+    db.put(b"cherry", b"red").await?;
+
+    // Create snapshot
+    let snapshot = db.snapshot().await?;
+
+    // Modify database
+    db.put(b"apple", b"green").await?;     // Modify existing
+    db.put(b"date", b"brown").await?;      // Add new
+    db.delete(b"banana").await?;           // Delete existing
+
+    // Scan snapshot - sees original data
+    println!("Snapshot scan:");
+    let mut snap_iter = snapshot.scan(b"a".to_vec()..=b"z".to_vec()).await?;
+    while let Some(kv) = snap_iter.next().await? {
+        println!("  {}: {}",
+            String::from_utf8_lossy(&kv.key),
+            String::from_utf8_lossy(&kv.value)
+        );
+    }
+    // Output:
+    //   apple: red
+    //   banana: yellow
+    //   cherry: red
+
+    // Scan database - sees modified data
+    println!("\nDatabase scan:");
+    let mut db_iter = db.scan(b"a".to_vec()..=b"z".to_vec()).await?;
+    while let Some(kv) = db_iter.next().await? {
+        println!("  {}: {}",
+            String::from_utf8_lossy(&kv.key),
+            String::from_utf8_lossy(&kv.value)
+        );
+    }
+    // Output:
+    //   apple: green
+    //   cherry: red
+    //   date: brown
+
+    db.close().await?;
+    Ok(())
+}
+```
+
+## Performance Considerations
+
+### Snapshot Overhead
+
+Snapshots are lightweight:
+- **Creation**: Very fast, just captures a sequence number
+- **Memory**: Minimal overhead, shares data structures with main DB
+- **Multiple snapshots**: Can create many snapshots with little cost
+
+```rust
+// Creating multiple snapshots is cheap
+let snap1 = db.snapshot().await?;
+let snap2 = db.snapshot().await?;
+let snap3 = db.snapshot().await?;
+
+// Each sees progressively newer data
+```
+
+### Snapshot Lifetime
+
+<Warning>
+Long-lived snapshots can prevent garbage collection of old data. Drop snapshots when you're done with them.
+</Warning>
+
+```rust
+{
+    let snapshot = db.snapshot().await?;
+    // Use snapshot...
+}  // Snapshot dropped here, resources released
+```
+
+## Snapshots vs Transactions
+
+| Feature | Snapshot | Transaction |
+|---------|----------|-------------|
+| **Purpose** | Read-only view | Read-write operations |
+| **Writes** | Not allowed | Buffered until commit |
+| **Isolation** | Point-in-time | MVCC with conflict detection |
+| **Duration** | Can be long-lived | Should be short-lived |
+| **Use case** | Analytics, backups | ACID updates |
+
+```rust
+// Snapshot: Read-only, long-lived
+let snapshot = db.snapshot().await?;
+let value = snapshot.get(b"key").await?;
+// snapshot.put() doesn't exist - read-only!
+
+// Transaction: Read-write, short-lived
+let txn = db.begin(IsolationLevel::Snapshot).await?;
+let value = txn.get(b"key").await?;
+txn.put(b"key", b"new_value")?;  // Allowed
+txn.commit().await?;
+```
+
+## Best Practices
+
+<Tip>
+**Drop snapshots when done**: Don't hold snapshots longer than necessary to avoid preventing garbage collection.
+</Tip>
+
+<Tip>
+**Use for consistent reads**: When you need multiple reads to be consistent with each other, use a snapshot instead of individual `get()` calls.
+</Tip>
+
+<Tip>
+**Perfect for reporting**: Run reports against snapshots while the database continues serving production traffic.
+</Tip>
+
+<Warning>
+**Read-only limitation**: Snapshots cannot perform writes. Use transactions if you need to write based on read data.
+</Warning>
+
+## Common Patterns
+
+### Periodic Snapshots for Monitoring
+
+```rust
+use tokio::time::{interval, Duration};
+
+let mut ticker = interval(Duration::from_secs(60));
+loop {
+    ticker.tick().await;
+    
+    let snapshot = db.snapshot().await?;
+    
+    // Collect metrics
+    let mut count = 0;
+    let mut iter = snapshot.scan::<Vec<u8>, _>(..).await?;
+    while let Some(_) = iter.next().await? {
+        count += 1;
+    }
+    
+    println!("Total keys at {}: {}", chrono::Utc::now(), count);
+    drop(snapshot);  // Release immediately
+}
+```
+
+### Compare Before and After
+
+```rust
+// Capture before state
+let before = db.snapshot().await?;
+
+// Perform operations
+perform_batch_updates(&db).await?;
+
+// Capture after state
+let after = db.snapshot().await?;
+
+// Compare states
+let before_val = before.get(b"counter").await?;
+let after_val = after.get(b"counter").await?;
+```
+
+## Next Steps
+
+- Learn about [Checkpoints](/guides/checkpoints) for durable snapshots
+- Explore [Transactions](/guides/transactions) for read-write isolation
+- Understand [Range Queries](/guides/range-queries) for efficient scanning

@@ -1,0 +1,385 @@
+---
+title: DbBuilder
+description: Builder for configuring and creating a SlateDB database
+---
+
+The `DbBuilder` struct provides a fluent API for configuring and opening a SlateDB database. It separates the concerns of configuration options (settings) and components.
+
+## Creating a Builder
+
+### new()
+
+Creates a new builder for a database at the given path.
+
+```rust
+pub fn new(path: P, main_object_store: Arc<dyn ObjectStore>) -> Self
+```
+
+<ParamField path="path" type="P: Into<Path>" required>
+  The path to the database
+</ParamField>
+
+<ParamField path="main_object_store" type="Arc<dyn ObjectStore>" required>
+  The object store to use for the database
+</ParamField>
+
+<ResponseField name="DbBuilder" type="DbBuilder<P>">
+  Returns a new builder instance
+</ResponseField>
+
+<Note>
+You typically create a builder by calling `Db::builder()` rather than calling `new()` directly.
+</Note>
+
+## Configuration Methods
+
+### with_settings()
+
+Sets the database settings.
+
+```rust
+pub fn with_settings(mut self, settings: Settings) -> Self
+```
+
+<ParamField path="settings" type="Settings" required>
+  The settings to use for the database
+</ParamField>
+
+<ResponseField name="Self" type="DbBuilder<P>">
+  Returns the builder for chaining
+</ResponseField>
+
+**Example:**
+
+```rust
+use slatedb::{Db, config::Settings, Error};
+use slatedb::object_store::memory::InMemory;
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> Result<(), Error> {
+    let object_store = Arc::new(InMemory::new());
+    let db = Db::builder("test_db", object_store)
+        .with_settings(Settings {
+            min_filter_keys: 2000,
+            ..Default::default()
+        })
+        .build()
+        .await?;
+    Ok(())
+}
+```
+
+### with_wal_object_store()
+
+Sets the separate object store dedicated specifically for WAL.
+
+NOTE: WAL durability and availability properties depend on the properties of the underlying object store. Make sure the configured object store is durable and available enough for your use case.
+
+```rust
+pub fn with_wal_object_store(mut self, wal_object_store: Arc<dyn ObjectStore>) -> Self
+```
+
+<ParamField path="wal_object_store" type="Arc<dyn ObjectStore>" required>
+  The object store to use for WAL
+</ParamField>
+
+<ResponseField name="Self" type="DbBuilder<P>">
+  Returns the builder for chaining
+</ResponseField>
+
+### with_db_cache()
+
+Sets the cache to use for the database for caching SST blocks.
+
+SlateDB uses a cache to efficiently store and retrieve blocks and SST metadata locally. `slatedb::db_cache::SplitCache` is used by default.
+
+```rust
+pub fn with_db_cache(mut self, db_cache: Arc<dyn DbCache>) -> Self
+```
+
+<ParamField path="db_cache" type="Arc<dyn DbCache>" required>
+  The cache implementation to use
+</ParamField>
+
+<ResponseField name="Self" type="DbBuilder<P>">
+  Returns the builder for chaining
+</ResponseField>
+
+**Example:**
+
+```rust
+use slatedb::{Db, Error};
+use slatedb::db_cache::foyer::FoyerCache;
+use slatedb::object_store::memory::InMemory;
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> Result<(), Error> {
+    let object_store = Arc::new(InMemory::new());
+    let db = Db::builder("test_db", object_store)
+        .with_db_cache(Arc::new(FoyerCache::new()))
+        .build()
+        .await?;
+    Ok(())
+}
+```
+
+### with_db_cache_disabled()
+
+Disables the SST block/metadata cache.
+
+```rust
+pub fn with_db_cache_disabled(mut self) -> Self
+```
+
+<ResponseField name="Self" type="DbBuilder<P>">
+  Returns the builder for chaining
+</ResponseField>
+
+### with_system_clock()
+
+Sets the system clock to use for the database. System timestamps are used for scheduling operations such as compaction and garbage collection.
+
+```rust
+pub fn with_system_clock(mut self, clock: Arc<dyn SystemClock>) -> Self
+```
+
+<ParamField path="clock" type="Arc<dyn SystemClock>" required>
+  The system clock implementation to use
+</ParamField>
+
+<ResponseField name="Self" type="DbBuilder<P>">
+  Returns the builder for chaining
+</ResponseField>
+
+**Example:**
+
+```rust
+use slatedb::{Db, Error};
+use slatedb::object_store::memory::InMemory;
+use slatedb_common::clock::DefaultSystemClock;
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> Result<(), Error> {
+    let object_store = Arc::new(InMemory::new());
+    let clock = Arc::new(DefaultSystemClock::new());
+    let db = Db::builder("test_db", object_store)
+        .with_system_clock(clock)
+        .build()
+        .await?;
+    Ok(())
+}
+```
+
+### with_gc_runtime()
+
+Sets the garbage collection runtime to use for the database.
+
+```rust
+pub fn with_gc_runtime(mut self, gc_runtime: Handle) -> Self
+```
+
+<ParamField path="gc_runtime" type="Handle" required>
+  The Tokio runtime handle to use for garbage collection
+</ParamField>
+
+<ResponseField name="Self" type="DbBuilder<P>">
+  Returns the builder for chaining
+</ResponseField>
+
+### with_compactor_builder()
+
+Sets a custom CompactorBuilder for compaction orchestration.
+
+Setting a `CompactorBuilder` will ignore any previous `Settings::compactor_options` configuration passed in through `with_settings` since the `CompactorBuilder` provides its own configuration.
+
+```rust
+pub fn with_compactor_builder(mut self, compactor_builder: CompactorBuilder<P>) -> Self
+```
+
+<ParamField path="compactor_builder" type="CompactorBuilder<P>" required>
+  The compactor builder to use
+</ParamField>
+
+<ResponseField name="Self" type="DbBuilder<P>">
+  Returns the builder for chaining
+</ResponseField>
+
+### with_fp_registry()
+
+Sets the fail point registry to use for the database.
+
+```rust
+pub fn with_fp_registry(mut self, fp_registry: Arc<FailPointRegistry>) -> Self
+```
+
+<ParamField path="fp_registry" type="Arc<FailPointRegistry>" required>
+  The fail point registry for testing
+</ParamField>
+
+<ResponseField name="Self" type="DbBuilder<P>">
+  Returns the builder for chaining
+</ResponseField>
+
+### with_seed()
+
+Sets the seed to use for the database's random number generator. All random behavior in SlateDB will use random number generators based off of this seed. This includes random bytes for UUIDs and ULIDs, as well as random pickers in cache eviction policies.
+
+If not set, SlateDB uses the OS's random number generator to generate a seed.
+
+```rust
+pub fn with_seed(mut self, seed: u64) -> Self
+```
+
+<ParamField path="seed" type="u64" required>
+  The random seed to use
+</ParamField>
+
+<ResponseField name="Self" type="DbBuilder<P>">
+  Returns the builder for chaining
+</ResponseField>
+
+### with_sst_block_size()
+
+Sets the block size for SSTable blocks. Blocks are the unit of reading and caching in SlateDB. Smaller blocks can reduce read amplification but may increase metadata overhead. Larger blocks are more efficient for sequential scans but may waste bandwidth for point lookups.
+
+Note: When compression is enabled, blocks are compressed individually. Larger blocks typically achieve better compression ratios.
+
+```rust
+pub fn with_sst_block_size(mut self, block_size: SstBlockSize) -> Self
+```
+
+<ParamField path="block_size" type="SstBlockSize" required>
+  The block size variant to use (1KB, 2KB, 4KB, 8KB, 16KB, 32KB, or 64KB)
+</ParamField>
+
+<ResponseField name="Self" type="DbBuilder<P>">
+  Returns the builder for chaining
+</ResponseField>
+
+**Example:**
+
+```rust
+use slatedb::{Db, Error};
+use slatedb::config::SstBlockSize;
+use slatedb::object_store::memory::InMemory;
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> Result<(), Error> {
+    let object_store = Arc::new(InMemory::new());
+    let db = Db::builder("test_db", object_store)
+        .with_sst_block_size(SstBlockSize::Block8Kib) // 8KiB blocks
+        .build()
+        .await?;
+    Ok(())
+}
+```
+
+### with_merge_operator()
+
+Sets the merge operator to use for the database. The merge operator allows applications to bypass the traditional read/modify/write cycle by expressing partial updates using an associative operator.
+
+```rust
+pub fn with_merge_operator(mut self, merge_operator: MergeOperatorType) -> Self
+```
+
+<ParamField path="merge_operator" type="MergeOperatorType" required>
+  An Arc-wrapped merge operator implementation
+</ParamField>
+
+<ResponseField name="Self" type="DbBuilder<P>">
+  Returns the builder for chaining
+</ResponseField>
+
+### with_block_transformer()
+
+Sets the block transformer to use for the database. The block transformer allows custom encoding/decoding of block data before storage and after retrieval. This can be used for encryption or other transformations.
+
+The transformer is applied after compression on write and before decompression on read. The checksum is calculated on the transformed data.
+
+```rust
+pub fn with_block_transformer(mut self, block_transformer: Arc<dyn BlockTransformer>) -> Self
+```
+
+<ParamField path="block_transformer" type="Arc<dyn BlockTransformer>" required>
+  An Arc-wrapped block transformer implementation
+</ParamField>
+
+<ResponseField name="Self" type="DbBuilder<P>">
+  Returns the builder for chaining
+</ResponseField>
+
+## Building the Database
+
+### build()
+
+Builds and opens the database.
+
+```rust
+pub async fn build(self) -> Result<Db, Error>
+```
+
+<ResponseField name="Result" type="Result<Db, Error>">
+  Returns the database instance on success, or an error if the database could not be opened
+</ResponseField>
+
+**Example:**
+
+```rust
+use slatedb::{Db, Error};
+use slatedb::object_store::memory::InMemory;
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> Result<(), Error> {
+    let object_store = Arc::new(InMemory::new());
+    let db = Db::builder("test_db", object_store)
+        .build()
+        .await?;
+    Ok(())
+}
+```
+
+## Complete Example
+
+Here's a complete example showing multiple configuration options:
+
+```rust
+use slatedb::{Db, Error};
+use slatedb::config::{Settings, SstBlockSize};
+use slatedb::db_cache::foyer::FoyerCache;
+use slatedb::object_store::memory::InMemory;
+use slatedb_common::clock::DefaultSystemClock;
+use std::sync::Arc;
+use std::time::Duration;
+
+#[tokio::main]
+async fn main() -> Result<(), Error> {
+    let object_store = Arc::new(InMemory::new());
+    let clock = Arc::new(DefaultSystemClock::new());
+    let cache = Arc::new(FoyerCache::new());
+    
+    let db = Db::builder("my_database", object_store)
+        .with_settings(Settings {
+            min_filter_keys: 1000,
+            flush_interval: Some(Duration::from_millis(100)),
+            max_unflushed_bytes: 64 * 1024 * 1024, // 64MB
+            ..Default::default()
+        })
+        .with_system_clock(clock)
+        .with_db_cache(cache)
+        .with_sst_block_size(SstBlockSize::Block8Kib)
+        .with_seed(42)
+        .build()
+        .await?;
+    
+    // Use the database...
+    db.put(b"key", b"value").await?;
+    
+    db.close().await?;
+    Ok(())
+}
+```

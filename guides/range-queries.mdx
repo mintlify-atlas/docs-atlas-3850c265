@@ -1,0 +1,420 @@
+---
+title: Range Queries
+description: Efficiently scan and iterate over ranges of keys in SlateDB
+---
+
+Range queries allow you to efficiently scan multiple keys in sorted order. SlateDB provides powerful range scanning capabilities with support for bounded ranges, prefix scans, and bidirectional iteration.
+
+## Understanding Range Scans
+
+SlateDB stores keys in sorted order, making range scans efficient. You can:
+- Scan all keys in the database
+- Scan between specific start and end keys
+- Scan keys with a common prefix
+- Seek to specific positions within a range
+- Iterate in ascending or descending order
+
+## Basic Range Scanning
+
+### Unbounded Scan
+
+Iterate over all keys in the database:
+
+```rust
+use slatedb::{Db, Error};
+use slatedb::object_store::memory::InMemory;
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> Result<(), Error> {
+    let object_store = Arc::new(InMemory::new());
+    let db = Db::open("my_db", object_store).await?;
+
+    // Add some data
+    db.put(b"key1", b"value1").await?;
+    db.put(b"key2", b"value2").await?;
+    db.put(b"key3", b"value3").await?;
+
+    // Scan all keys
+    let mut iter = db.scan::<Vec<u8>, _>(..).await?;
+    while let Some(kv) = iter.next().await? {
+        println!("{}: {}",
+            String::from_utf8_lossy(&kv.key),
+            String::from_utf8_lossy(&kv.value)
+        );
+    }
+
+    db.close().await?;
+    Ok(())
+}
+```
+
+### Bounded Range Scan
+
+Scan between specific keys:
+
+```rust
+// Exclusive end: [start, end)
+let mut iter = db.scan(b"key1".to_vec()..b"key5".to_vec()).await?;
+
+// Inclusive end: [start, end]
+let mut iter = db.scan(b"key1".to_vec()..=b"key5".to_vec()).await?;
+
+// From start, no end: [start, ∞)
+let mut iter = db.scan(b"key3".to_vec()..).await?;
+
+// No start, to end: (-∞, end)
+let mut iter = db.scan(..b"key5".to_vec()).await?;
+```
+
+### Prefix Scan
+
+Scan all keys sharing a common prefix:
+
+```rust
+// Find all keys starting with "user:"
+let mut iter = db.scan_prefix(b"user:").await?;
+while let Some(kv) = iter.next().await? {
+    println!("User: {:?}", kv.key);
+}
+```
+
+<Tip>
+Prefix scans are efficient and commonly used for namespacing keys. Consider using prefixes like `user:`, `session:`, `cache:` to organize your data.
+</Tip>
+
+## Iterator Operations
+
+### Seeking Within a Range
+
+Jump to a specific position in an iterator:
+
+```rust
+let mut iter = db.scan::<Vec<u8>, _>(..).await?;
+
+// Skip to "key_100" or the next key after it
+iter.seek(b"key_100").await?;
+
+while let Some(kv) = iter.next().await? {
+    println!("{:?}", kv.key);
+    // First item will be key_100 or the next key >= key_100
+}
+```
+
+### Practical Seek Example
+
+```rust
+use slatedb::{Db, Error};
+use slatedb::object_store::memory::InMemory;
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> Result<(), Error> {
+    let object_store = Arc::new(InMemory::new());
+    let db = Db::open("my_db", object_store).await?;
+
+    // Insert test data
+    db.put(b"test_key1", b"value1").await?;
+    db.put(b"test_key2", b"value2").await?;
+    db.put(b"test_key3", b"value3").await?;
+    db.put(b"test_key4", b"value4").await?;
+
+    let mut iter = db.scan::<Vec<u8>, _>(..).await?;
+    
+    // Jump to test_key4
+    iter.seek(b"test_key4").await?;
+    
+    let kv = iter.next().await?.unwrap();
+    assert_eq!(kv.key, b"test_key4");
+    assert_eq!(kv.value, b"value4");
+    
+    // No more items after test_key4
+    assert_eq!(iter.next().await?, None);
+
+    db.close().await?;
+    Ok(())
+}
+```
+
+## Advanced Scan Options
+
+### Custom Scan Options
+
+```rust
+use slatedb::config::{ScanOptions, DurabilityLevel};
+
+let options = ScanOptions {
+    durability_filter: DurabilityLevel::Memory,
+    ..ScanOptions::default()
+};
+
+let mut iter = db.scan_with_options(
+    b"start".to_vec()..b"end".to_vec(),
+    &options,
+).await?;
+```
+
+### Scan with Read Options
+
+You can also specify read options when scanning:
+
+```rust
+use slatedb::config::{ScanOptions, ReadLevel};
+
+let options = ScanOptions {
+    read_level: ReadLevel::Uncommitted,
+    ..ScanOptions::default()
+};
+
+let mut iter = db.scan_prefix_with_options(b"user:", &options).await?;
+```
+
+## Common Patterns
+
+### Paginated Scanning
+
+Implement pagination for large datasets:
+
+```rust
+async fn scan_page(
+    db: &Db,
+    start_key: Option<Vec<u8>>,
+    page_size: usize,
+) -> Result<(Vec<(Vec<u8>, Vec<u8>)>, Option<Vec<u8>>), Error> {
+    let mut results = Vec::new();
+    let mut last_key = None;
+
+    let mut iter = if let Some(start) = start_key {
+        db.scan(start.clone()..).await?
+    } else {
+        db.scan::<Vec<u8>, _>(..).await?
+    };
+
+    while results.len() < page_size {
+        if let Some(kv) = iter.next().await? {
+            last_key = Some(kv.key.to_vec());
+            results.push((kv.key.to_vec(), kv.value.to_vec()));
+        } else {
+            break;
+        }
+    }
+
+    // Return results and next page start key
+    let next_key = if results.len() == page_size {
+        last_key
+    } else {
+        None
+    };
+
+    Ok((results, next_key))
+}
+
+// Usage
+let (page1, next) = scan_page(&db, None, 100).await?;
+println!("Page 1: {} items", page1.len());
+
+if let Some(next_key) = next {
+    let (page2, _) = scan_page(&db, Some(next_key), 100).await?;
+    println!("Page 2: {} items", page2.len());
+}
+```
+
+### Count Keys in Range
+
+```rust
+async fn count_keys_in_range(
+    db: &Db,
+    start: Vec<u8>,
+    end: Vec<u8>,
+) -> Result<usize, Error> {
+    let mut count = 0;
+    let mut iter = db.scan(start..end).await?;
+    
+    while let Some(_) = iter.next().await? {
+        count += 1;
+    }
+    
+    Ok(count)
+}
+
+// Count all user keys
+let user_count = count_keys_in_range(
+    &db,
+    b"user:".to_vec(),
+    b"user;" .to_vec(), // Next character after ':'
+).await?;
+println!("Total users: {}", user_count);
+```
+
+### Collect Range into Vec
+
+```rust
+async fn collect_range(
+    db: &Db,
+    prefix: &[u8],
+) -> Result<Vec<(Vec<u8>, Vec<u8>)>, Error> {
+    let mut results = Vec::new();
+    let mut iter = db.scan_prefix(prefix).await?;
+    
+    while let Some(kv) = iter.next().await? {
+        results.push((kv.key.to_vec(), kv.value.to_vec()));
+    }
+    
+    Ok(results)
+}
+
+// Collect all session data
+let sessions = collect_range(&db, b"session:").await?;
+println!("Found {} sessions", sessions.len());
+```
+
+### Filter While Scanning
+
+```rust
+async fn scan_with_filter<F>(
+    db: &Db,
+    prefix: &[u8],
+    filter: F,
+) -> Result<Vec<Vec<u8>>, Error>
+where
+    F: Fn(&[u8]) -> bool,
+{
+    let mut results = Vec::new();
+    let mut iter = db.scan_prefix(prefix).await?;
+    
+    while let Some(kv) = iter.next().await? {
+        if filter(&kv.value) {
+            results.push(kv.key.to_vec());
+        }
+    }
+    
+    Ok(results)
+}
+
+// Find all active users
+let active_users = scan_with_filter(
+    &db,
+    b"user:",
+    |value| value == b"active",
+).await?;
+```
+
+## Range Scans in Transactions
+
+Scans within transactions see both committed data and buffered writes:
+
+```rust
+use slatedb::IsolationLevel;
+
+let txn = db.begin(IsolationLevel::Snapshot).await?;
+
+// Add buffered write
+txn.put(b"user:999", b"new_user")?;
+
+// Scan sees both committed data and buffered write
+let mut iter = txn.scan_prefix(b"user:").await?;
+while let Some(kv) = iter.next().await? {
+    // Will include user:999 even though it's not committed yet
+    println!("{:?}", kv.key);
+}
+
+txn.commit().await?;
+```
+
+<Tip>
+Transaction scans track read ranges for conflict detection in SerializableSnapshot isolation.
+</Tip>
+
+## Range Scans in Snapshots
+
+Snapshots provide consistent range scans even as the database changes:
+
+```rust
+let snapshot = db.snapshot().await?;
+
+// Modify database
+db.put(b"key_new", b"new_value").await?;
+
+// Snapshot scan doesn't see the new key
+let mut iter = snapshot.scan::<Vec<u8>, _>(..).await?;
+while let Some(kv) = iter.next().await? {
+    // Will not include key_new
+}
+```
+
+## Performance Considerations
+
+### Efficient Range Scanning
+
+<Tip>
+**Use prefix scans when possible**: They're more efficient than bounded ranges for key patterns.
+</Tip>
+
+<Tip>
+**Limit scan scope**: Narrow ranges are faster than full scans. Use bounds to reduce I/O.
+</Tip>
+
+<Tip>
+**Consider pagination**: For large result sets, use pagination to avoid loading everything into memory.
+</Tip>
+
+### Memory Usage
+
+```rust
+// ❌ Bad: Loads entire database into memory
+let mut all_data = Vec::new();
+let mut iter = db.scan::<Vec<u8>, _>(..).await?;
+while let Some(kv) = iter.next().await? {
+    all_data.push((kv.key.to_vec(), kv.value.to_vec()));
+}
+
+// ✅ Good: Process items as you scan
+let mut iter = db.scan::<Vec<u8>, _>(..).await?;
+while let Some(kv) = iter.next().await? {
+    process_item(&kv.key, &kv.value).await?;
+    // Item dropped here, memory freed
+}
+```
+
+## Best Practices
+
+<Tip>
+**Use meaningful key prefixes**: Design your key schema with range queries in mind.
+</Tip>
+
+<Tip>
+**Close iterators promptly**: Don't hold iterators longer than needed, especially in transactions.
+</Tip>
+
+<Warning>
+**Avoid unbounded scans in production**: Always limit scan scope with ranges or pagination for large datasets.
+</Warning>
+
+## Key Design for Range Queries
+
+Design your keys to enable efficient range queries:
+
+```rust
+// Good: Hierarchical keys enable efficient scans
+db.put(b"user:1000:profile", b"...").await?;
+db.put(b"user:1000:settings", b"...").await?;
+db.put(b"user:1001:profile", b"...").await?;
+
+// Scan all data for user 1000
+let mut iter = db.scan_prefix(b"user:1000:").await?;
+
+// Scan all user profiles
+let start = b"user:".to_vec();
+let mut iter = db.scan(start.clone()..).await?;
+while let Some(kv) = iter.next().await? {
+    if kv.key.ends_with(b":profile") {
+        // Process profile
+    }
+}
+```
+
+## Next Steps
+
+- Learn about [Transactions](/guides/transactions) for consistent range scans
+- Explore [Snapshots](/guides/snapshots) for point-in-time range queries
+- Understand [Basic Operations](/guides/basic-operations) for single-key access

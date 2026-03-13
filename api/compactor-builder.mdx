@@ -1,0 +1,264 @@
+---
+title: CompactorBuilder
+description: Builder for configuring SlateDB compactor
+---
+
+## Overview
+
+The `CompactorBuilder` provides a flexible way to configure and customize the compactor for a SlateDB database. The compactor is responsible for merging groups of sorted runs to reduce space amplification (by removing old versions of rows) and read amplification (by reducing the number of sorted runs).
+
+## Architecture
+
+The compactor consists of several key components:
+
+- **Compactor**: Main event loop that orchestrates the compaction process
+- **CompactionScheduler**: Policy that decides when and what to compact
+- **CompactionExecutor**: Runs compaction tasks, merges inputs, and writes output SSTs
+- **CompactorEventHandler**: Event-driven controller that handles manifest polling, scheduling, and execution
+
+## Configuration
+
+Compactor configuration can be provided in two ways:
+
+1. Through `Settings.compactor_options` (via configuration files or environment variables)
+2. Using `DbBuilder::with_compactor_builder()` for programmatic configuration
+
+**Note:** These two approaches are mutually exclusive. Using both will result in an error.
+
+## CompactorOptions
+
+The `CompactorOptions` struct configures compactor runtime behavior.
+
+### Fields
+
+#### `poll_interval`
+
+**Type:** `Duration`  
+**Default:** `5s`
+
+The interval at which the compactor checks for a new manifest and decides if a compaction must be scheduled.
+
+**Configuration examples:**
+```toml
+[compactor_options]
+poll_interval = "5s"
+```
+
+```json
+{
+  "compactor_options": {
+    "poll_interval": "5s"
+  }
+}
+```
+
+#### `manifest_update_timeout`
+
+**Type:** `Duration`  
+**Default:** `300s`
+
+Timeout to limit how long manifest updates are retried before giving up.
+
+#### `max_sst_size`
+
+**Type:** `usize`  
+**Default:** `268435456` (256 MiB)
+
+A compacted SSTable's maximum size (in bytes). If more data needs to be written to a Sorted Run during a compaction, a new SSTable will be created when this size is exceeded.
+
+**Configuration examples:**
+```toml
+[compactor_options]
+max_sst_size = 268435456
+```
+
+#### `max_concurrent_compactions`
+
+**Type:** `usize`  
+**Default:** `4`
+
+The maximum number of concurrent compactions to execute at once.
+
+**Configuration examples:**
+```toml
+[compactor_options]
+max_concurrent_compactions = 4
+```
+
+#### `scheduler_options`
+
+**Type:** `HashMap<String, String>`  
+**Default:** `{}` (empty)
+
+Scheduler-specific options expressed as string key/value pairs. The available options depend on the compaction scheduler being used.
+
+## Size-Tiered Compaction Scheduler
+
+SlateDB currently implements a size-tiered compaction strategy via `SizeTieredCompactionSchedulerOptions`.
+
+### Scheduler Options
+
+#### `min_compaction_sources`
+
+**Type:** `usize`  
+**Default:** `4`
+
+The minimum number of sources to include together in a single compaction step.
+
+#### `max_compaction_sources`
+
+**Type:** `usize`  
+**Default:** `8`
+
+The maximum number of sources to include together in a single compaction step.
+
+#### `include_size_threshold`
+
+**Type:** `f32`  
+**Default:** `4.0`
+
+The size threshold that the scheduler uses to determine if a sorted run should be included in a given compaction. A sorted run S will be added to compaction C if S's size is less than this value times the minimum size of the runs currently included in C.
+
+### Configuration Example
+
+```toml
+[compactor_options]
+poll_interval = "5s"
+max_sst_size = 1073741824
+max_concurrent_compactions = 4
+
+[compactor_options.scheduler_options]
+min_compaction_sources = "4"
+max_compaction_sources = "8"
+include_size_threshold = "4.0"
+```
+
+```json
+{
+  "compactor_options": {
+    "poll_interval": "5s",
+    "max_sst_size": 1073741824,
+    "max_concurrent_compactions": 4,
+    "scheduler_options": {
+      "min_compaction_sources": "4",
+      "max_compaction_sources": "8",
+      "include_size_threshold": "4.0"
+    }
+  }
+}
+```
+
+## CompactionScheduler Trait
+
+The `CompactionScheduler` trait defines the policy for deciding when and what to compact.
+
+### Methods
+
+#### `propose(state: &CompactorStateView) -> Vec<CompactionSpec>`
+
+Proposes compaction specs for the current state.
+
+**Parameters:**
+- `state`: Process-local view of the DB's manifest and compactions
+
+**Returns:** List of `CompactionSpec` describing what to compact and where to write
+
+#### `validate(state: &CompactorStateView, spec: &CompactionSpec) -> Result<(), Error>`
+
+Validates a candidate compaction spec against scheduler-specific invariants. The default implementation accepts everything.
+
+**Parameters:**
+- `state`: Process-local view of the DB's manifest and compactions
+- `spec`: Proposed `CompactionSpec`
+
+**Returns:** `Ok(())` if valid, or an `Error` if invalid
+
+#### `generate(state: &CompactorStateView, request: &CompactionRequest) -> Result<Vec<CompactionSpec>, Error>`
+
+Generates a compaction based on a compaction request.
+
+- For `CompactionRequest::Spec`, returns the provided spec
+- For `CompactionRequest::Full`, generates a spec that includes all current L0 SSTs and sorted runs
+
+**Parameters:**
+- `state`: Process-local view of the DB's manifest and compactions
+- `request`: The compaction request to plan
+
+**Returns:** List of `CompactionSpec` or an `Error` if invalid
+
+## CompactionSchedulerSupplier Trait
+
+The `CompactionSchedulerSupplier` trait provides a factory for creating scheduler instances.
+
+### Method
+
+#### `compaction_scheduler(options: &CompactorOptions) -> Box<dyn CompactionScheduler + Send + Sync>`
+
+Creates a new `CompactionScheduler` using the provided options.
+
+**Parameters:**
+- `options`: Compactor runtime tuning knobs
+
+**Returns:** A boxed scheduler that decides which compactions to run next
+
+## Compaction Lifecycle
+
+The compactor follows this high-level flow:
+
+1. Poll manifest and merge remote state into local `CompactorState`
+2. Ask the `CompactionScheduler` for candidate `CompactionSpec` values
+3. For each accepted spec:
+   - Create a `Compaction` (id + spec)
+   - Derive `StartCompactionJobArgs` with concrete inputs
+   - Pass to the executor
+4. Upon completion, update `CompactorState`, write a new manifest, and repeat
+
+## Naming Hierarchy
+
+The compactor uses a consistent naming hierarchy:
+
+- **`CompactionSpec`**: Description of a compaction to perform (what to compact and where)
+- **`Compaction`**: A concrete compaction entity with a stable ID (ULID) that the system decided to run
+- **Compaction Job**: A single job attempt the executor runs (currently 1:1 with `Compaction`)
+
+## Metrics
+
+The compactor exposes several metrics:
+
+- `compactor.last_compaction_timestamp_sec`: Unix timestamp of the last completed compaction
+- `compactor.running_compactions`: Gauge tracking active compaction attempts
+- `compactor.bytes_compacted`: Counter of bytes written by the executor
+- `compactor.total_bytes_being_compacted`: Total bytes across all running compactions
+- `compactor.total_throughput_bytes_per_sec`: Combined throughput across all running compactions
+
+## Example Usage
+
+### Using Settings
+
+```rust
+use slatedb::config::Settings;
+use slatedb::db::Db;
+use std::sync::Arc;
+use object_store::memory::InMemory;
+
+let mut settings = Settings::default();
+settings.compactor_options.as_mut().unwrap().max_concurrent_compactions = 8;
+
+let db = Db::builder("/path/to/db", Arc::new(InMemory::new()))
+    .with_settings(settings)
+    .build()
+    .await?;
+```
+
+### Using Environment Variables
+
+```bash
+export SLATEDB_COMPACTOR_OPTIONS.POLL_INTERVAL=10s
+export SLATEDB_COMPACTOR_OPTIONS.MAX_CONCURRENT_COMPACTIONS=8
+export SLATEDB_COMPACTOR_OPTIONS.SCHEDULER_OPTIONS.MIN_COMPACTION_SOURCES=8
+```
+
+## See Also
+
+- [Settings](/api/settings) - Database configuration options
+- [GarbageCollectorBuilder](/api/garbage-collector-builder) - Configure garbage collection

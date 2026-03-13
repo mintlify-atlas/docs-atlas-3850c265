@@ -1,0 +1,347 @@
+---
+title: Garbage Collector
+description: Configuration options for SlateDB's garbage collection
+---
+
+The garbage collector is responsible for removing obsolete data from SlateDB storage to reclaim space and maintain database health.
+
+## Overview
+
+SlateDB's garbage collector cleans up:
+- **Write-ahead log (WAL) SSTs** that are no longer referenced by active manifests or checkpoints
+- **Compacted SSTs** that are no longer referenced by active manifests or checkpoints
+- **Old manifests** that are not needed for recovery or checkpoints
+- **Compactions files** that contain completed compactor job state
+
+The garbage collector runs periodically in the background with configurable intervals and minimum age thresholds for each type of data.
+
+<Info>
+  The minimum age threshold ensures that recently created data isn't immediately deleted, preventing the removal of files that might still be referenced by in-flight operations.
+</Info>
+
+## GarbageCollectorOptions
+
+The `GarbageCollectorOptions` struct configures garbage collection for different data types.
+
+<ParamField path="manifest_options" type="Option<GarbageCollectorDirectoryOptions>">
+  Garbage collection options for the manifest directory.
+  
+  When `None`, garbage collection is disabled for manifests.
+</ParamField>
+
+<ParamField path="wal_options" type="Option<GarbageCollectorDirectoryOptions>">
+  Garbage collection options for the WAL directory.
+  
+  When `None`, garbage collection is disabled for WAL files.
+</ParamField>
+
+<ParamField path="compacted_options" type="Option<GarbageCollectorDirectoryOptions>">
+  Garbage collection options for the compacted directory (compacted SSTables).
+  
+  When `None`, garbage collection is disabled for compacted SSTs.
+</ParamField>
+
+<ParamField path="compactions_options" type="Option<GarbageCollectorDirectoryOptions>">
+  Garbage collection options for the compactions directory, which contains compactor job state `.compactions` files.
+  
+  When `None`, garbage collection is disabled for compaction state files.
+</ParamField>
+
+## GarbageCollectorDirectoryOptions
+
+Each directory type can be configured with its own garbage collection schedule and age threshold.
+
+<ParamField path="interval" type="Option<Duration>" default="60s">
+  The interval at which the garbage collector will run in the background thread for this directory.
+  
+  When `None`, recurring garbage collection is disabled for this directory, but one-time garbage collection can still be triggered manually via `GarbageCollector::run_gc_once`.
+</ParamField>
+
+<ParamField path="min_age" type="Duration" default="300s">
+  The minimum age of a file before it can be garbage collected (5 minutes default).
+  
+  This prevents the deletion of files that might still be in use by in-flight operations. Files younger than this age are never deleted.
+</ParamField>
+
+## Default Configuration
+
+By default, garbage collection is enabled for all managed directories with the following settings:
+
+- **Manifests**: Run every 60s, delete files older than 5 minutes
+- **WAL**: Run every 60s, delete files older than 5 minutes
+- **Compacted SSTs**: Run every 60s, delete files older than 5 minutes
+- **Compactions**: Run every 60s, delete files older than 5 minutes
+
+```rust
+use slatedb::config::GarbageCollectorOptions;
+let default_gc = GarbageCollectorOptions::default();
+```
+
+## Configuration Examples
+
+<CodeGroup>
+```toml TOML
+[garbage_collector_options.manifest_options]
+interval = "300s"  # 5 minutes
+min_age = "86400s"  # 24 hours
+
+[garbage_collector_options.wal_options]
+interval = "60s"  # 1 minute
+min_age = "60s"  # 1 minute
+
+[garbage_collector_options.compacted_options]
+interval = "300s"  # 5 minutes
+min_age = "86400s"  # 24 hours
+
+[garbage_collector_options.compactions_options]
+interval = "300s"  # 5 minutes
+min_age = "86400s"  # 24 hours
+```
+
+```json JSON
+{
+  "garbage_collector_options": {
+    "manifest_options": {
+      "interval": "300s",
+      "min_age": "86400s"
+    },
+    "wal_options": {
+      "interval": "60s",
+      "min_age": "60s"
+    },
+    "compacted_options": {
+      "interval": "300s",
+      "min_age": "86400s"
+    },
+    "compactions_options": {
+      "interval": "300s",
+      "min_age": "86400s"
+    }
+  }
+}
+```
+
+```yaml YAML
+garbage_collector_options:
+  manifest_options:
+    interval: '300s'
+    min_age: '86400s'
+  wal_options:
+    interval: '60s'
+    min_age: '60s'
+  compacted_options:
+    interval: '300s'
+    min_age: '86400s'
+  compactions_options:
+    interval: '300s'
+    min_age: '86400s'
+```
+
+```rust Rust
+use slatedb::config::{
+    Settings, GarbageCollectorOptions, GarbageCollectorDirectoryOptions
+};
+use std::time::Duration;
+
+let gc_options = GarbageCollectorOptions {
+    manifest_options: Some(GarbageCollectorDirectoryOptions {
+        interval: Some(Duration::from_secs(300)),
+        min_age: Duration::from_secs(86400),
+    }),
+    wal_options: Some(GarbageCollectorDirectoryOptions {
+        interval: Some(Duration::from_secs(60)),
+        min_age: Duration::from_secs(60),
+    }),
+    compacted_options: Some(GarbageCollectorDirectoryOptions {
+        interval: Some(Duration::from_secs(300)),
+        min_age: Duration::from_secs(86400),
+    }),
+    compactions_options: Some(GarbageCollectorDirectoryOptions {
+        interval: Some(Duration::from_secs(300)),
+        min_age: Duration::from_secs(86400),
+    }),
+};
+
+let settings = Settings {
+    garbage_collector_options: Some(gc_options),
+    ..Settings::default()
+};
+```
+</CodeGroup>
+
+## Environment Variables
+
+You can configure garbage collection via environment variables:
+
+```bash
+export SLATEDB_GARBAGE_COLLECTOR_OPTIONS.MANIFEST_OPTIONS.INTERVAL="600s"
+export SLATEDB_GARBAGE_COLLECTOR_OPTIONS.MANIFEST_OPTIONS.MIN_AGE="172800s"
+export SLATEDB_GARBAGE_COLLECTOR_OPTIONS.WAL_OPTIONS.INTERVAL="120s"
+export SLATEDB_GARBAGE_COLLECTOR_OPTIONS.WAL_OPTIONS.MIN_AGE="120s"
+```
+
+## Tuning Recommendations
+
+### Aggressive Cleanup (Minimize Storage)
+
+For environments where storage costs are a priority:
+
+```toml
+[garbage_collector_options.manifest_options]
+interval = "60s"
+min_age = "300s"  # 5 minutes
+
+[garbage_collector_options.wal_options]
+interval = "30s"
+min_age = "60s"  # 1 minute
+
+[garbage_collector_options.compacted_options]
+interval = "60s"
+min_age = "300s"  # 5 minutes
+
+[garbage_collector_options.compactions_options]
+interval = "60s"
+min_age = "300s"  # 5 minutes
+```
+
+<Warning>
+  Very short `min_age` values increase the risk of deleting files that are still in use. Always maintain at least 1-2 minutes of buffer.
+</Warning>
+
+### Conservative Cleanup (Maximize Safety)
+
+For environments where data safety is critical and storage is abundant:
+
+```toml
+[garbage_collector_options.manifest_options]
+interval = "3600s"  # 1 hour
+min_age = "604800s"  # 7 days
+
+[garbage_collector_options.wal_options]
+interval = "3600s"  # 1 hour
+min_age = "86400s"  # 1 day
+
+[garbage_collector_options.compacted_options]
+interval = "3600s"  # 1 hour
+min_age = "604800s"  # 7 days
+
+[garbage_collector_options.compactions_options]
+interval = "3600s"  # 1 hour
+min_age = "604800s"  # 7 days
+```
+
+### WAL-Heavy Workloads
+
+For workloads with high write throughput that generate many WAL files:
+
+```toml
+[garbage_collector_options.wal_options]
+interval = "30s"
+min_age = "60s"
+
+# Keep other directories at default intervals
+[garbage_collector_options.manifest_options]
+interval = "300s"
+min_age = "3600s"
+```
+
+### Checkpoint-Heavy Workloads
+
+For workloads that create many checkpoints:
+
+```toml
+[garbage_collector_options.manifest_options]
+interval = "600s"  # 10 minutes
+min_age = "172800s"  # 2 days
+
+[garbage_collector_options.compacted_options]
+interval = "600s"  # 10 minutes
+min_age = "172800s"  # 2 days
+```
+
+<Info>
+  Longer `min_age` values for manifests and compacted SSTs ensure that checkpoints have sufficient time to be processed before their referenced data is deleted.
+</Info>
+
+## Disabling Garbage Collection
+
+You can disable garbage collection for specific directories or entirely:
+
+### Disable Specific Directory
+
+<CodeGroup>
+```toml TOML
+# Disable WAL garbage collection
+[garbage_collector_options]
+wal_options = null
+
+# Keep other directories enabled
+[garbage_collector_options.manifest_options]
+interval = "300s"
+min_age = "86400s"
+```
+
+```rust Rust
+use slatedb::config::{Settings, GarbageCollectorOptions, GarbageCollectorDirectoryOptions};
+use std::time::Duration;
+
+let gc_options = GarbageCollectorOptions {
+    manifest_options: Some(GarbageCollectorDirectoryOptions::default()),
+    wal_options: None,  // Disabled
+    compacted_options: Some(GarbageCollectorDirectoryOptions::default()),
+    compactions_options: Some(GarbageCollectorDirectoryOptions::default()),
+};
+```
+</CodeGroup>
+
+### Disable Recurring GC (Manual Only)
+
+Set `interval` to `None` to disable automatic garbage collection while still allowing manual triggers:
+
+```rust
+use slatedb::config::GarbageCollectorDirectoryOptions;
+use std::time::Duration;
+
+let manual_only = GarbageCollectorDirectoryOptions {
+    interval: None,  // No automatic runs
+    min_age: Duration::from_secs(300),
+};
+```
+
+### Disable All Garbage Collection
+
+<CodeGroup>
+```toml TOML
+garbage_collector_options = null
+```
+
+```rust Rust
+use slatedb::config::Settings;
+
+let settings = Settings {
+    garbage_collector_options: None,
+    ..Settings::default()
+};
+```
+</CodeGroup>
+
+<Warning>
+  Disabling garbage collection will cause storage usage to grow indefinitely. Only disable if you have an external cleanup mechanism.
+</Warning>
+
+## Manual Garbage Collection
+
+Even with automatic garbage collection configured, you can manually trigger a garbage collection run:
+
+```rust
+use slatedb::garbage_collector::GarbageCollector;
+
+// Assuming you have a GarbageCollector instance
+let gc = // ... your garbage collector
+gc.run_gc_once().await?;
+```
+
+This is useful for:
+- Testing garbage collection behavior
+- Triggering cleanup after major operations (e.g., bulk deletions)
+- Running cleanup in response to storage pressure alerts

@@ -1,0 +1,326 @@
+---
+title: AWS S3 Configuration
+description: Configure SlateDB with Amazon S3 object storage
+---
+
+Amazon S3 is a popular choice for SlateDB's object storage backend, offering high durability, availability, and scalability.
+
+## Prerequisites
+
+- An AWS account
+- An S3 bucket created in your desired region
+- AWS credentials (access key ID and secret access key)
+- `aws` feature enabled in your `Cargo.toml`
+
+```toml Cargo.toml
+[dependencies]
+slatedb = { version = "*", features = ["aws"] }
+object_store = { version = "*", features = ["aws"] }
+```
+
+## Authentication Methods
+
+SlateDB supports multiple ways to authenticate with AWS S3:
+
+<CodeGroup>
+
+```rust Environment Variables (Recommended)
+use object_store::aws::{AmazonS3Builder, S3ConditionalPut};
+use slatedb::Db;
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    // Load configuration from environment variables
+    let s3_store = Arc::new(
+        AmazonS3Builder::from_env()
+            .with_conditional_put(S3ConditionalPut::ETagMatch)
+            .build()?
+    );
+
+    let db = Db::open("/tmp/slatedb", s3_store).await?;
+    
+    db.put(b"key", b"value").await?;
+    db.close().await?;
+    
+    Ok(())
+}
+```
+
+```rust Explicit Credentials
+use object_store::aws::{AmazonS3Builder, S3ConditionalPut};
+use slatedb::Db;
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let s3_store = Arc::new(
+        AmazonS3Builder::new()
+            .with_bucket_name("my-slatedb-bucket")
+            .with_region("us-east-1")
+            .with_access_key_id("AKIAIOSFODNN7EXAMPLE")
+            .with_secret_access_key("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY")
+            .with_conditional_put(S3ConditionalPut::ETagMatch)
+            .build()?
+    );
+
+    let db = Db::open("/tmp/slatedb", s3_store).await?;
+    
+    db.put(b"key", b"value").await?;
+    db.close().await?;
+    
+    Ok(())
+}
+```
+
+```rust IAM Role (EC2/ECS)
+use object_store::aws::{AmazonS3Builder, S3ConditionalPut};
+use slatedb::Db;
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    // When running on EC2 or ECS with an IAM role,
+    // credentials are automatically discovered
+    let s3_store = Arc::new(
+        AmazonS3Builder::new()
+            .with_bucket_name("my-slatedb-bucket")
+            .with_region("us-east-1")
+            .with_conditional_put(S3ConditionalPut::ETagMatch)
+            .build()?
+    );
+
+    let db = Db::open("/tmp/slatedb", s3_store).await?;
+    
+    db.put(b"key", b"value").await?;
+    db.close().await?;
+    
+    Ok(())
+}
+```
+
+</CodeGroup>
+
+<Warning>
+  Never hardcode credentials in your source code. Use environment variables, IAM roles, or a secrets management service in production.
+</Warning>
+
+## Environment Variables
+
+When using `AmazonS3Builder::from_env()`, the following environment variables are supported:
+
+| Variable | Description | Required |
+|----------|-------------|----------|
+| `AWS_BUCKET_NAME` | S3 bucket name | Yes |
+| `AWS_REGION` | AWS region (e.g., us-east-1) | Yes |
+| `AWS_ACCESS_KEY_ID` | AWS access key ID | Yes* |
+| `AWS_SECRET_ACCESS_KEY` | AWS secret access key | Yes* |
+| `AWS_SESSION_TOKEN` | Session token for temporary credentials | No |
+| `AWS_ENDPOINT` | Custom endpoint URL | No |
+| `AWS_ALLOW_HTTP` | Allow HTTP connections (default: false) | No |
+
+\* Not required when using IAM roles
+
+### Example Configuration
+
+```bash .env
+AWS_REGION=us-east-1
+AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE
+AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
+AWS_BUCKET_NAME=my-slatedb-bucket
+```
+
+## Conditional PUT Operations
+
+<Warning>
+  SlateDB requires S3 conditional PUT support to ensure data consistency. Always configure `S3ConditionalPut::ETagMatch`.
+</Warning>
+
+SlateDB uses ETags for optimistic concurrency control:
+
+```rust
+use object_store::aws::S3ConditionalPut;
+
+let s3_store = AmazonS3Builder::new()
+    .with_bucket_name("my-bucket")
+    .with_region("us-east-1")
+    // REQUIRED: Enable conditional PUT with ETag matching
+    .with_conditional_put(S3ConditionalPut::ETagMatch)
+    .build()?;
+```
+
+## Configuration Options
+
+### Custom Endpoint
+
+Useful for S3-compatible services or VPC endpoints:
+
+```rust
+let s3_store = AmazonS3Builder::new()
+    .with_bucket_name("my-bucket")
+    .with_region("us-east-1")
+    .with_endpoint("https://s3.us-east-1.vpce.amazonaws.com")
+    .with_conditional_put(S3ConditionalPut::ETagMatch)
+    .build()?;
+```
+
+### Virtual-Hosted Style vs Path Style
+
+By default, S3 uses virtual-hosted style URLs. For some configurations, you may need path style:
+
+```rust
+let s3_store = AmazonS3Builder::new()
+    .with_bucket_name("my-bucket")
+    .with_region("us-east-1")
+    .with_virtual_hosted_style_request(false)  // Use path-style
+    .with_conditional_put(S3ConditionalPut::ETagMatch)
+    .build()?;
+```
+
+## Complete Example
+
+Here's a complete example showing database operations with S3:
+
+```rust
+use object_store::aws::{AmazonS3Builder, S3ConditionalPut};
+use slatedb::{config::PutOptions, Db};
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    // Configure S3 object store
+    let s3_store = Arc::new(
+        AmazonS3Builder::from_env()
+            .with_conditional_put(S3ConditionalPut::ETagMatch)
+            .build()?
+    );
+
+    println!("Opening the database");
+    let db = Db::open("/tmp/slatedb_s3", s3_store.clone()).await?;
+
+    // Put a value and wait for the flush
+    println!("Writing a value and waiting for flush");
+    db.put(b"k1", b"value1").await?;
+    println!("Value: {:?}", db.get(b"k1").await?);
+
+    // Put multiple keys without waiting for durability
+    println!("Writing 1000 keys without waiting for flush");
+    let write_options = slatedb::config::WriteOptions {
+        await_durable: false,
+    };
+    for i in 0..1000 {
+        db.put_with_options(
+            format!("key{}", i).as_bytes(),
+            format!("value{}", i).as_bytes(),
+            &PutOptions::default(),
+            &write_options,
+        )
+        .await?;
+    }
+
+    // Flush to make writes durable
+    println!("Flushing the writes and closing the db");
+    db.flush().await?;
+    db.close().await?;
+
+    // Reopen the database and read values
+    println!("Reopening the database");
+    let db_reopened = Db::open("/tmp/slatedb_s3", s3_store).await?;
+    
+    println!("Reading values from the reopened database");
+    for i in 0..20 {
+        println!(
+            "{:?}",
+            db_reopened.get(format!("key{}", i).as_bytes()).await
+        );
+    }
+    
+    db_reopened.close().await?;
+
+    Ok(())
+}
+```
+
+## Performance Optimization
+
+### Multipart Uploads
+
+For large values, configure multipart upload settings:
+
+```rust
+let s3_store = AmazonS3Builder::new()
+    .with_bucket_name("my-bucket")
+    .with_region("us-east-1")
+    .with_multipart_threshold(8 * 1024 * 1024)  // 8MB threshold
+    .with_conditional_put(S3ConditionalPut::ETagMatch)
+    .build()?;
+```
+
+### Connection Pooling
+
+The `object_store` crate handles connection pooling automatically, but you can tune it:
+
+```rust
+let s3_store = AmazonS3Builder::new()
+    .with_bucket_name("my-bucket")
+    .with_region("us-east-1")
+    .with_client_options(
+        object_store::ClientOptions::new()
+            .with_timeout(std::time::Duration::from_secs(30))
+    )
+    .with_conditional_put(S3ConditionalPut::ETagMatch)
+    .build()?;
+```
+
+## IAM Permissions
+
+Your AWS credentials need these S3 permissions:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject",
+        "s3:PutObject",
+        "s3:DeleteObject",
+        "s3:ListBucket"
+      ],
+      "Resource": [
+        "arn:aws:s3:::my-slatedb-bucket",
+        "arn:aws:s3:::my-slatedb-bucket/*"
+      ]
+    }
+  ]
+}
+```
+
+## Troubleshooting
+
+### Region Mismatch
+
+Ensure your region matches your bucket's region:
+
+```bash
+aws s3api get-bucket-location --bucket my-slatedb-bucket
+```
+
+### Credential Issues
+
+Test your credentials:
+
+```bash
+aws s3 ls s3://my-slatedb-bucket --region us-east-1
+```
+
+### Conditional PUT Errors
+
+If you see errors about conditional operations, verify that `S3ConditionalPut::ETagMatch` is configured.
+
+## Next Steps
+
+- Learn about [database operations](/guides/basic-operations)
+- Configure [compaction settings](/configuration/compactor)
+- Set up [monitoring](/configuration/settings)

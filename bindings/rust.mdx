@@ -1,0 +1,237 @@
+---
+title: 'Rust'
+description: 'Use SlateDB in Rust applications with native async/await support'
+---
+
+SlateDB is written in Rust and provides a fully-featured native API. The Rust implementation is the reference implementation and includes all features.
+
+## Installation
+
+Add SlateDB to your `Cargo.toml`:
+
+```toml
+[dependencies]
+slatedb = "0.11.1"
+tokio = { version = "1", features = ["full"] }
+```
+
+## Basic Usage
+
+Here's a simple example showing core operations:
+
+```rust
+use slatedb::{Db, Error};
+use slatedb::object_store::{ObjectStore, memory::InMemory};
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> Result<(), Error> {
+    // Setup with in-memory object store
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let db = Db::open("/tmp/slatedb_example", object_store).await?;
+
+    // Put a key-value pair
+    db.put(b"hello", b"world").await?;
+
+    // Get a value
+    match db.get(b"hello").await? {
+        Some(value) => println!("Value: {:?}", value),
+        None => println!("Key not found"),
+    }
+
+    // Delete a key
+    db.delete(b"hello").await?;
+
+    // Close the database
+    db.close().await?;
+
+    Ok(())
+}
+```
+
+## Range Scans
+
+SlateDB supports efficient range queries:
+
+```rust
+use slatedb::{Db, Error};
+
+#[tokio::main]
+async fn main() -> Result<(), Error> {
+    // ... setup db ...
+
+    // Insert test data
+    db.put(b"user:1", b"alice").await?;
+    db.put(b"user:2", b"bob").await?;
+    db.put(b"user:3", b"charlie").await?;
+
+    // Scan over an unbound range
+    let mut iter = db.scan::<Vec<u8>, _>(..).await?;
+    while let Ok(Some(item)) = iter.next().await {
+        println!("Key: {:?}, Value: {:?}", item.key, item.value);
+    }
+
+    // Scan over a bound range
+    let mut iter = db.scan(b"user:1"..=b"user:2").await?;
+    while let Ok(Some(item)) = iter.next().await {
+        println!("Key: {:?}, Value: {:?}", item.key, item.value);
+    }
+
+    // Seek to a specific key
+    let mut iter = db.scan::<Vec<u8>, _>(..).await?;
+    iter.seek(b"user:2").await?;
+    if let Ok(Some(item)) = iter.next().await {
+        println!("Found: {:?}", item.key);
+    }
+
+    Ok(())
+}
+```
+
+## Feature Flags
+
+SlateDB provides several optional features you can enable:
+
+### Cloud Provider Support
+
+```toml
+[dependencies]
+slatedb = { version = "0.11.1", features = ["aws"] }  # Default
+slatedb = { version = "0.11.1", features = ["azure"] }
+```
+
+### Compression
+
+Enable specific compression algorithms:
+
+```toml
+[dependencies]
+slatedb = { version = "0.11.1", features = ["snappy"] }
+slatedb = { version = "0.11.1", features = ["zlib"] }
+slatedb = { version = "0.11.1", features = ["lz4"] }
+slatedb = { version = "0.11.1", features = ["zstd"] }
+```
+
+Or enable all compression formats:
+
+```toml
+[dependencies]
+slatedb = { version = "0.11.1", features = ["compression"] }
+```
+
+### Caching
+
+Choose your caching implementation:
+
+```toml
+[dependencies]
+slatedb = { version = "0.11.1", features = ["foyer"] }  # Default, high-performance
+slatedb = { version = "0.11.1", features = ["moka"] }   # Alternative
+```
+
+### OpenDAL Support
+
+Use OpenDAL for additional object store backends:
+
+```toml
+[dependencies]
+slatedb = { version = "0.11.1", features = ["opendal"] }
+```
+
+### Advanced Features
+
+```toml
+[dependencies]
+# Disable WAL for testing/benchmarking
+slatedb = { version = "0.11.1", features = ["wal_disable"] }
+
+# Enable compaction filters (experimental)
+slatedb = { version = "0.11.1", features = ["compaction_filters"] }
+
+# Test utilities
+slatedb = { version = "0.11.1", features = ["test-util"] }
+
+# Enable everything
+slatedb = { version = "0.11.1", features = ["all"] }
+```
+
+## Object Store Configuration
+
+SlateDB uses the [`object_store`](https://docs.rs/object_store/latest/object_store/) crate, which is re-exported for convenience:
+
+```rust
+use slatedb::Db;
+use slatedb::object_store::aws::AmazonS3Builder;
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> Result<(), slatedb::Error> {
+    // AWS S3
+    let s3 = AmazonS3Builder::new()
+        .with_bucket_name("my-bucket")
+        .with_region("us-west-2")
+        .build()?;
+
+    let db = Db::open("/tmp/cache", Arc::new(s3)).await?;
+
+    // Use the database...
+
+    db.close().await?;
+    Ok(())
+}
+```
+
+For local development, use the in-memory or filesystem stores:
+
+```rust
+use slatedb::object_store::memory::InMemory;
+use slatedb::object_store::local::LocalFileSystem;
+use std::sync::Arc;
+
+// In-memory (for testing)
+let store = Arc::new(InMemory::new());
+
+// Local filesystem
+let store = Arc::new(LocalFileSystem::new_with_prefix("/tmp/object-store")?);
+```
+
+## API Documentation
+
+For complete API documentation, visit [docs.rs/slatedb](https://docs.rs/slatedb/latest/slatedb/).
+
+## Examples
+
+The SlateDB repository includes several example programs:
+
+- `simple_example.rs` - Basic put/get/delete operations
+- `full_example.rs` - Complete example with scans
+- `s3_compatible.rs` - Using S3-compatible storage
+- `azure_blob_storage.rs` - Using Azure Blob Storage
+- `google_cloud_storage.rs` - Using Google Cloud Storage
+- `create_checkpoint.rs` - Working with checkpoints
+- `create_snapshot.rs` - Working with snapshots
+- `change_data_capture.rs` - CDC example
+- `standalone_compactor.rs` - Running compactor separately
+
+Run examples from the repository root:
+
+```bash
+cargo run --example simple_example
+```
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Transactions" icon="rotate" href="/guides/transactions">
+    Learn about ACID transactions with SSI and SI
+  </Card>
+  <Card title="Snapshots" icon="camera" href="/guides/snapshots">
+    Create consistent point-in-time views
+  </Card>
+  <Card title="Checkpoints" icon="bookmark" href="/guides/checkpoints">
+    Manage durable checkpoints
+  </Card>
+  <Card title="Configuration" icon="gear" href="/configuration/settings">
+    Customize SlateDB behavior
+  </Card>
+</CardGroup>

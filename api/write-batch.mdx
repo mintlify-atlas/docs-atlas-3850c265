@@ -1,0 +1,481 @@
+---
+title: "WriteBatch"
+description: "Atomic batch write operations"
+---
+
+## Overview
+
+`WriteBatch` allows you to group multiple write operations (puts, deletes, and merges) and apply them atomically to the database. All operations in a batch succeed or fail together.
+
+## Struct Definition
+
+```rust
+pub struct WriteBatch {
+    // Internal fields
+}
+```
+
+## Creating a Batch
+
+```rust
+use slatedb::WriteBatch;
+
+let mut batch = WriteBatch::new();
+```
+
+## Methods
+
+### `new`
+
+Create a new empty `WriteBatch`.
+
+```rust
+pub fn new() -> Self
+```
+
+**Returns:** A new empty `WriteBatch`.
+
+### `put`
+
+Add a put operation to the batch.
+
+```rust
+pub fn put<K, V>(&mut self, key: K, value: V)
+where
+    K: AsRef<[u8]>,
+    V: AsRef<[u8]>,
+```
+
+**Parameters:**
+- `key` - The key to put (must not be empty)
+- `value` - The value to store
+
+**Panics:**
+- If the key is empty
+- If the key size is larger than `u16::MAX` (65,535 bytes)
+- If the value size is larger than `u32::MAX` (4,294,967,295 bytes)
+
+**Example:**
+```rust
+batch.put(b"key1", b"value1");
+```
+
+### `put_with_options`
+
+Add a put operation with custom options (e.g., TTL).
+
+```rust
+pub fn put_with_options<K, V>(
+    &mut self,
+    key: K,
+    value: V,
+    options: &PutOptions,
+)
+where
+    K: AsRef<[u8]>,
+    V: AsRef<[u8]>,
+```
+
+**Parameters:**
+- `key` - The key to put
+- `value` - The value to store
+- `options` - Put options (e.g., TTL configuration)
+
+**Example:**
+```rust
+use slatedb::config::{PutOptions, Ttl};
+
+let options = PutOptions {
+    ttl: Ttl::ExpireAfter(3600), // 1 hour
+};
+batch.put_with_options(b"key1", b"value1", &options);
+```
+
+### `merge`
+
+Add a merge operation to the batch.
+
+```rust
+pub fn merge<K, V>(&mut self, key: K, value: V)
+where
+    K: AsRef<[u8]>,
+    V: AsRef<[u8]>,
+```
+
+**Parameters:**
+- `key` - The key to merge (must not be empty)
+- `value` - The merge operand
+
+**Requires:** A `MergeOperator` configured on the database.
+
+**Example:**
+```rust
+// Increment a counter
+batch.merge(b"counter", &1u64.to_le_bytes());
+```
+
+### `merge_with_options`
+
+Add a merge operation with custom options.
+
+```rust
+pub fn merge_with_options<K, V>(
+    &mut self,
+    key: K,
+    value: V,
+    options: &MergeOptions,
+)
+where
+    K: AsRef<[u8]>,
+    V: AsRef<[u8]>,
+```
+
+**Parameters:**
+- `key` - The key to merge
+- `value` - The merge operand
+- `options` - Merge options (e.g., TTL)
+
+**Example:**
+```rust
+use slatedb::config::{MergeOptions, Ttl};
+
+let options = MergeOptions {
+    ttl: Ttl::ExpireAfter(7200), // 2 hours
+};
+batch.merge_with_options(b"counter", &5u64.to_le_bytes(), &options);
+```
+
+### `delete`
+
+Add a delete operation to the batch.
+
+```rust
+pub fn delete<K: AsRef<[u8]>>(&mut self, key: K)
+```
+
+**Parameters:**
+- `key` - The key to delete (must not be empty)
+
+**Example:**
+```rust
+batch.delete(b"key1");
+```
+
+### `is_empty`
+
+Check if the batch contains any operations.
+
+```rust
+pub fn is_empty(&self) -> bool
+```
+
+**Returns:** `true` if the batch has no operations, `false` otherwise.
+
+## Basic Usage
+
+### Simple Batch Operations
+
+```rust
+use slatedb::{Db, WriteBatch};
+use std::sync::Arc;
+
+// Create batch
+let mut batch = WriteBatch::new();
+batch.put(b"key1", b"value1");
+batch.put(b"key2", b"value2");
+batch.delete(b"key3");
+
+// Write batch atomically
+db.write(batch).await?;
+```
+
+### With TTL Options
+
+```rust
+use slatedb::config::{PutOptions, Ttl};
+
+let mut batch = WriteBatch::new();
+
+let ttl_1h = PutOptions {
+    ttl: Ttl::ExpireAfter(3600),
+};
+let ttl_24h = PutOptions {
+    ttl: Ttl::ExpireAfter(86400),
+};
+
+batch.put_with_options(b"session:123", b"data", &ttl_1h);
+batch.put_with_options(b"cache:456", b"data", &ttl_24h);
+
+db.write(batch).await?;
+```
+
+### With Merge Operations
+
+```rust
+// Assuming a counter merge operator is configured
+let mut batch = WriteBatch::new();
+
+// Multiple merges for the same key are preserved
+batch.merge(b"page_views", &1u64.to_le_bytes());
+batch.merge(b"page_views", &5u64.to_le_bytes());
+batch.merge(b"page_views", &3u64.to_le_bytes());
+
+// All three merge operands will be applied
+db.write(batch).await?;
+```
+
+## Operation Ordering and Deduplication
+
+### Put and Delete Behavior
+
+<Info>
+When multiple `put` or `delete` operations are added for the same key, only the **last operation** is retained. Previous operations are automatically removed.
+</Info>
+
+```rust
+let mut batch = WriteBatch::new();
+batch.put(b"key1", b"value1");
+batch.put(b"key1", b"value2"); // Overwrites previous put
+batch.delete(b"key1");          // Replaces both puts
+
+// Batch now contains only: delete("key1")
+```
+
+### Merge Behavior
+
+<Info>
+Merge operations are **not deduplicated**. Multiple merge operations for the same key are all preserved and will be applied in order.
+</Info>
+
+```rust
+let mut batch = WriteBatch::new();
+batch.merge(b"counter", &1u64.to_le_bytes());
+batch.merge(b"counter", &2u64.to_le_bytes());
+batch.merge(b"counter", &3u64.to_le_bytes());
+
+// All three merge operations are preserved
+db.write(batch).await?;
+
+// Result: counter = 1 + 2 + 3 = 6
+```
+
+### Mixed Operations
+
+```rust
+let mut batch = WriteBatch::new();
+
+// Scenario 1: Put then Merge
+batch.put(b"key1", b"base");     // Base value
+batch.merge(b"key1", b"data1");  // Merge on top of put
+batch.merge(b"key1", b"data2");  // Another merge
+// Result: put(base) + merge(data1) + merge(data2)
+
+// Scenario 2: Merge then Put
+batch.merge(b"key2", b"data1");  // Merge operand
+batch.merge(b"key2", b"data2");  // Another merge
+batch.put(b"key2", b"final");    // Overwrites all merges
+// Result: Only put(final) remains
+
+// Scenario 3: Delete then Merge
+batch.delete(b"key3");           // Delete key
+batch.merge(b"key3", b"data1");  // Merge on top of delete
+// Result: delete + merge(data1)
+```
+
+## Atomicity Guarantees
+
+<Warning>
+**All operations in a batch are applied atomically.** Either all operations succeed and become visible together, or none of them are applied.
+</Warning>
+
+```rust
+let mut batch = WriteBatch::new();
+batch.put(b"balance:alice", &(-100i64).to_le_bytes());
+batch.put(b"balance:bob", &100i64.to_le_bytes());
+
+// Both updates happen atomically
+db.write(batch).await?;
+```
+
+## Size Considerations
+
+<Info>
+`WriteBatch` has **unlimited size**. However, be aware:
+
+1. **L0 SST Size**: Batches can exceed `l0_sst_size_bytes` when WAL is disabled
+2. **WAL Size**: Large batches create large WAL SSTs
+3. **Memory**: Large batches consume memory proportional to their size
+</Info>
+
+```rust
+// Large batch example
+let mut batch = WriteBatch::new();
+for i in 0..1_000_000 {
+    batch.put(format!("key:{}", i).as_bytes(), b"value");
+}
+// This works, but may create a very large SST
+db.write(batch).await?;
+```
+
+## Advanced Examples
+
+### Counter Implementation
+
+```rust
+use std::sync::Arc;
+use bytes::Bytes;
+use slatedb::{Db, WriteBatch, MergeOperator, MergeOperatorError};
+
+struct CounterMergeOperator;
+
+impl MergeOperator for CounterMergeOperator {
+    fn merge(
+        &self,
+        _key: &Bytes,
+        existing: Option<Bytes>,
+        operand: Bytes,
+    ) -> Result<Bytes, MergeOperatorError> {
+        let base = existing
+            .map(|v| i64::from_le_bytes(v.as_ref().try_into().unwrap()))
+            .unwrap_or(0);
+        let delta = i64::from_le_bytes(operand.as_ref().try_into().unwrap());
+        Ok(Bytes::copy_from_slice(&(base + delta).to_le_bytes()))
+    }
+}
+
+// Configure database
+let db = Db::builder("mydb", object_store)
+    .with_merge_operator(Arc::new(CounterMergeOperator))
+    .build()
+    .await?;
+
+// Use batches for atomic counter updates
+let mut batch = WriteBatch::new();
+batch.merge(b"user:123:views", &1i64.to_le_bytes());
+batch.merge(b"user:123:clicks", &1i64.to_le_bytes());
+batch.merge(b"total:views", &1i64.to_le_bytes());
+batch.merge(b"total:clicks", &1i64.to_le_bytes());
+
+db.write(batch).await?;
+```
+
+### Conditional Updates
+
+```rust
+// Read-modify-write pattern with batches
+let current = db.get(b"counter").await?;
+let value = match current {
+    Some(bytes) => u64::from_le_bytes(bytes.as_ref().try_into().unwrap()),
+    None => 0,
+};
+
+if value < 100 {
+    let mut batch = WriteBatch::new();
+    batch.put(b"counter", &(value + 1).to_le_bytes());
+    batch.put(b"last_update", timestamp.as_bytes());
+    db.write(batch).await?;
+}
+```
+
+### Bulk Import
+
+```rust
+use slatedb::{Db, WriteBatch};
+
+async fn bulk_import(db: &Db, records: Vec<(Vec<u8>, Vec<u8>)>) -> Result<(), slatedb::Error> {
+    const BATCH_SIZE: usize = 10_000;
+    
+    for chunk in records.chunks(BATCH_SIZE) {
+        let mut batch = WriteBatch::new();
+        for (key, value) in chunk {
+            batch.put(key, value);
+        }
+        db.write(batch).await?;
+    }
+    
+    Ok(())
+}
+```
+
+## Error Handling
+
+```rust
+match db.write(batch).await {
+    Ok(_) => println!("Batch written successfully"),
+    Err(e) => eprintln!("Failed to write batch: {}", e),
+}
+```
+
+<Warning>
+If `db.write(batch)` returns an error, **none of the operations** in the batch were applied. You can safely retry the entire batch.
+</Warning>
+
+## Best Practices
+
+### Batch Size
+
+```rust
+// ✅ Good: Moderate batch sizes
+const BATCH_SIZE: usize = 1_000;
+for chunk in data.chunks(BATCH_SIZE) {
+    let mut batch = WriteBatch::new();
+    // ... add operations
+    db.write(batch).await?;
+}
+
+// ❌ Avoid: Extremely large batches (millions of entries)
+let mut batch = WriteBatch::new();
+for item in millions_of_items {
+    batch.put(&item.key, &item.value); // May consume excessive memory
+}
+```
+
+### Reusing Batch Instances
+
+<Info>
+`WriteBatch` is consumed by `db.write()`. Create a new batch for each write operation.
+</Info>
+
+```rust
+// ❌ Won't compile - batch is moved
+let mut batch = WriteBatch::new();
+batch.put(b"key1", b"value1");
+db.write(batch).await?;
+batch.put(b"key2", b"value2"); // Error: batch was moved
+
+// ✅ Correct: Create new batch
+let mut batch1 = WriteBatch::new();
+batch1.put(b"key1", b"value1");
+db.write(batch1).await?;
+
+let mut batch2 = WriteBatch::new();
+batch2.put(b"key2", b"value2");
+db.write(batch2).await?;
+```
+
+### Empty Batches
+
+```rust
+let batch = WriteBatch::new();
+
+if batch.is_empty() {
+    // Skip write if no operations
+    println!("No operations to write");
+} else {
+    db.write(batch).await?;
+}
+```
+
+## Performance Tips
+
+1. **Batch Related Operations**: Group related writes into a single batch for better throughput
+2. **Avoid Tiny Batches**: Each batch has overhead; prefer batches with multiple operations
+3. **Balance Batch Size**: Very large batches consume memory; very small batches have overhead
+4. **Use Merge for Counters**: Merge operations are more efficient than read-modify-write for counters
+
+## See Also
+
+- [MergeOperator API](/api/merge-operator) - Custom merge operations
+- [Basic Operations Guide](/guides/basic-operations) - Database usage examples
+- [Transactions Guide](/guides/transactions) - Batch operations in transactions
+- [Configuration Settings](/configuration/settings) - TTL and other options

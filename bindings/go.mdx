@@ -1,0 +1,422 @@
+---
+title: 'Go'
+description: 'Use SlateDB in Go applications via CGO bindings'
+---
+
+SlateDB provides official Go bindings built on top of the `slatedb-c` FFI layer. The bindings expose a Go-idiomatic API for all core SlateDB operations.
+
+## Prerequisites
+
+- Go 1.25+
+- CGO enabled
+- C toolchain (`cc`)
+- Rust toolchain (to build `slatedb-c`)
+
+## Installation
+
+### Step 1: Build slatedb-c
+
+From the SlateDB repository root:
+
+```bash
+cargo build --release -p slatedb-c
+```
+
+This creates the native library in `target/release/`.
+
+### Step 2: Set Library Path
+
+Ensure the dynamic linker can find the library:
+
+<CodeGroup>
+```bash macOS
+export DYLD_LIBRARY_PATH="$(pwd)/target/release:$DYLD_LIBRARY_PATH"
+```
+
+```bash Linux
+export LD_LIBRARY_PATH="$(pwd)/target/release:$LD_LIBRARY_PATH"
+```
+</CodeGroup>
+
+### Step 3: Import the Package
+
+Add the import to your Go code:
+
+```go
+import "slatedb.io/slatedb-go"
+```
+
+Then build and test:
+
+```bash
+cd slatedb-go/go
+go build
+go test ./...
+```
+
+## Basic Usage
+
+```go
+package main
+
+import (
+    "fmt"
+    "io"
+    "slatedb.io/slatedb-go"
+)
+
+func main() {
+    // Open database with explicit object store URL
+    db, err := slatedb.Open(
+        "/tmp/slatedb-cache",
+        slatedb.WithUrl[slatedb.DbConfig]("memory:///"),
+    )
+    if err != nil {
+        panic(err)
+    }
+    defer db.Close()
+
+    // Put a key-value pair
+    err = db.Put([]byte("hello"), []byte("world"))
+    if err != nil {
+        panic(err)
+    }
+
+    // Get a value
+    value, err := db.Get([]byte("hello"))
+    if err != nil {
+        panic(err)
+    }
+    fmt.Printf("Value: %s\n", value)
+
+    // Delete a key
+    err = db.Delete([]byte("hello"))
+    if err != nil {
+        panic(err)
+    }
+}
+```
+
+## Object Store Configuration
+
+SlateDB Go bindings support multiple ways to configure object storage:
+
+### 1. Explicit URL (Recommended)
+
+```go
+db, err := slatedb.Open(
+    "/tmp/cache",
+    slatedb.WithUrl[slatedb.DbConfig]("memory:///"),
+)
+```
+
+Supported URL schemes:
+- `memory://` - In-memory storage (testing)
+- `file:///path` - Local filesystem
+- `s3://bucket` - AWS S3
+- `gs://bucket` - Google Cloud Storage
+- `az://container` - Azure Blob Storage
+
+### 2. Environment Variables
+
+```bash
+# Set object store URL directly
+export SLATEDB_OBJECT_STORE_URL="memory:///"
+# or
+export OBJECT_STORE_URL="file:///tmp/slatedb"
+```
+
+```go
+// Automatically picks up environment variables
+db, err := slatedb.Open("/tmp/cache")
+```
+
+### 3. Provider-Based Configuration
+
+Create a `.env` file:
+
+<CodeGroup>
+```bash AWS S3
+CLOUD_PROVIDER=aws
+AWS_BUCKET=my-slate-bucket
+AWS_REGION=us-west-2
+AWS_ACCESS_KEY_ID=...
+AWS_SECRET_ACCESS_KEY=...
+```
+
+```bash Local Filesystem
+CLOUD_PROVIDER=local
+LOCAL_PATH=/tmp/slatedb-store
+```
+</CodeGroup>
+
+Then specify the env file:
+
+```go
+db, err := slatedb.Open(
+    "/tmp/cache",
+    slatedb.WithEnvFile[slatedb.DbConfig](".env"),
+)
+```
+
+## Builder Pattern with Settings
+
+For more control, use the builder pattern:
+
+```go
+builder, err := slatedb.NewBuilder("/tmp/cache")
+if err != nil {
+    panic(err)
+}
+
+settings := &slatedb.Settings{
+    FlushInterval:  "50ms",
+    L0SstSizeBytes: 128 * 1024 * 1024, // 128 MB
+}
+
+db, err := builder.
+    WithUrl("memory:///").
+    WithSettings(settings).
+    WithSstBlockSize(slatedb.SstBlockSize16Kib).
+    Build()
+if err != nil {
+    panic(err)
+}
+defer db.Close()
+```
+
+### Settings Helpers
+
+Load settings from various sources:
+
+```go
+// Default settings
+settings := slatedb.SettingsDefault()
+
+// From file (.json, .toml, .yaml, .yml)
+settings, err := slatedb.SettingsFromFile("config.toml")
+
+// From environment variables with prefix
+settings, err := slatedb.SettingsFromEnv("SLATEDB")
+
+// Auto-detect from well-known files and env
+settings, err := slatedb.SettingsLoad()
+
+// Merge settings (override takes precedence)
+merged := slatedb.MergeSettings(baseSettings, overrideSettings)
+```
+
+## Write Batches
+
+Batch multiple writes for atomic execution:
+
+```go
+batch, err := slatedb.NewWriteBatch()
+if err != nil {
+    panic(err)
+}
+defer batch.Close()
+
+// Add operations to batch
+err = batch.Put([]byte("key1"), []byte("value1"))
+err = batch.Put([]byte("key2"), []byte("value2"))
+err = batch.Delete([]byte("old-key"))
+
+// Commit batch atomically (consumes the batch)
+err = db.Write(batch)
+if err != nil {
+    panic(err)
+}
+```
+
+## Range Scans
+
+Iterate over key ranges:
+
+```go
+import "io"
+
+// Scan from "user:" prefix
+iter, err := db.Scan([]byte("user:"), nil)
+if err != nil {
+    panic(err)
+}
+defer iter.Close()
+
+for {
+    kv, err := iter.Next()
+    if err == io.EOF {
+        break
+    }
+    if err != nil {
+        panic(err)
+    }
+    fmt.Printf("Key: %s, Value: %s\n", kv.Key, kv.Value)
+}
+```
+
+### Prefix Scans
+
+```go
+iter, err := db.ScanPrefix([]byte("user:"))
+if err != nil {
+    panic(err)
+}
+defer iter.Close()
+
+for {
+    kv, err := iter.Next()
+    if err == io.EOF {
+        break
+    }
+    if err != nil {
+        panic(err)
+    }
+    // Process key-value pair
+}
+```
+
+### Seek in Iterators
+
+```go
+iter, err := db.Scan([]byte("a"), []byte("z"))
+if err != nil {
+    panic(err)
+}
+defer iter.Close()
+
+// Skip ahead to a specific key
+err = iter.Seek([]byte("m"))
+if err != nil {
+    panic(err)
+}
+
+// Continue iteration from "m"
+for {
+    kv, err := iter.Next()
+    if err == io.EOF {
+        break
+    }
+    // Process remaining keys
+}
+```
+
+## Read-Only Access with DbReader
+
+For read-only workloads, use `DbReader`:
+
+```go
+reader, err := slatedb.OpenReader(
+    "/tmp/cache",
+    slatedb.WithUrl[slatedb.DbReaderConfig]("memory:///"),
+    slatedb.WithDbReaderOptions(slatedb.DbReaderOptions{
+        ManifestPollInterval: 5000,  // ms
+        CheckpointLifetime:   300000, // ms
+    }),
+)
+if err != nil {
+    panic(err)
+}
+defer reader.Close()
+
+value, err := reader.Get([]byte("key"))
+if err != nil {
+    panic(err)
+}
+```
+
+### Checkpoint-Bound Reads
+
+```go
+reader, err := slatedb.OpenReader(
+    "/tmp/cache",
+    slatedb.WithUrl[slatedb.DbReaderConfig]("memory:///"),
+    slatedb.WithCheckpointId("01234567-89ab-cdef-0123-456789abcdef"),
+)
+if err != nil {
+    panic(err)
+}
+defer reader.Close()
+```
+
+## Logging
+
+Configure logging for the native SlateDB library:
+
+```go
+import "slatedb.io/slatedb-go"
+
+func main() {
+    // Initialize logging (call once at startup)
+    err := slatedb.InitLogging(slatedb.LogLevelInfo)
+    if err != nil {
+        panic(err)
+    }
+
+    // Change log level at runtime
+    err = slatedb.SetLoggingLevel(slatedb.LogLevelDebug)
+    if err != nil {
+        panic(err)
+    }
+
+    // Your application code...
+}
+```
+
+Available log levels:
+- `LogLevelError`
+- `LogLevelWarn`
+- `LogLevelInfo`
+- `LogLevelDebug`
+- `LogLevelTrace`
+
+## API Reference
+
+### Core DB Operations
+
+- `Open(path string, opts ...Option[DbConfig]) (*DB, error)`
+- `(*DB).Put(key, value []byte) error`
+- `(*DB).Get(key []byte) ([]byte, error)`
+- `(*DB).Delete(key []byte) error`
+- `(*DB).Flush() error`
+- `(*DB).Close() error`
+
+### Batch Operations
+
+- `NewWriteBatch() (*WriteBatch, error)`
+- `(*WriteBatch).Put(key, value []byte) error`
+- `(*WriteBatch).Delete(key []byte) error`
+- `(*DB).Write(batch *WriteBatch) error`
+
+### Scan Operations
+
+- `(*DB).Scan(start, end []byte) (*Iterator, error)`
+- `(*DB).ScanPrefix(prefix []byte) (*Iterator, error)`
+- `(*Iterator).Next() (KeyValue, error)`
+- `(*Iterator).Seek(key []byte) error`
+- `(*Iterator).Close() error`
+
+### Reader Operations
+
+- `OpenReader(path string, opts ...Option[DbReaderConfig]) (*DbReader, error)`
+- `(*DbReader).Get(key []byte) ([]byte, error)`
+- `(*DbReader).Scan(start, end []byte) (*Iterator, error)`
+- `(*DbReader).ScanPrefix(prefix []byte) (*Iterator, error)`
+- `(*DbReader).Close() error`
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Object Storage" icon="database" href="/object-storage/overview">
+    Configure S3, GCS, Azure, and more
+  </Card>
+  <Card title="Basic Operations" icon="code" href="/guides/basic-operations">
+    Learn core database operations
+  </Card>
+  <Card title="Range Queries" icon="magnifying-glass" href="/guides/range-queries">
+    Efficient scanning and iteration
+  </Card>
+  <Card title="Configuration" icon="gear" href="/configuration/settings">
+    Tune performance and behavior
+  </Card>
+</CardGroup>

@@ -1,0 +1,415 @@
+---
+title: "CompactionFilter"
+description: "Custom entry filtering during compaction"
+icon: "filter"
+---
+
+<Warning>
+When compaction filters are configured, snapshot consistency may be affected. Filters may modify or drop entries that active snapshots expect to see, causing snapshot reads to return unexpected results. Users who need consistent snapshots should carefully consider their filter logic.
+</Warning>
+
+## Overview
+
+The `CompactionFilter` API allows you to inspect, drop, convert to tombstone, or modify entries during the compaction process. This is only available when the `compaction_filters` feature is enabled.
+
+## Traits
+
+### CompactionFilter
+
+Filter that processes entries during a single compaction job.
+
+```rust
+#[async_trait]
+pub trait CompactionFilter: Send + Sync {
+    async fn filter(
+        &mut self,
+        entry: &RowEntry,
+    ) -> Result<CompactionFilterDecision, CompactionFilterError>;
+
+    async fn on_compaction_end(&mut self) -> Result<(), CompactionFilterError>;
+}
+```
+
+**Methods:**
+
+#### `filter`
+
+Filter a single entry during compaction.
+
+**Parameters:**
+- `entry: &RowEntry` - The entry to filter
+
+**Returns:**
+- `CompactionFilterDecision` - What to do with the entry
+- `Err(CompactionFilterError)` - Aborts compaction
+
+**Called for:** Every entry during compaction (potentially millions of times).
+
+#### `on_compaction_end`
+
+Called after successfully processing all entries.
+
+**Use for:**
+- Flushing state
+- Logging statistics
+- Cleaning up resources
+
+**Note:** Only called after all entries are processed. Not invoked if compaction fails.
+
+### CompactionFilterSupplier
+
+Factory that creates filter instances per compaction job.
+
+```rust
+#[async_trait]
+pub trait CompactionFilterSupplier: Send + Sync {
+    async fn create_compaction_filter(
+        &self,
+        context: &CompactionJobContext,
+    ) -> Result<Box<dyn CompactionFilter>, CompactionFilterError>;
+}
+```
+
+**Thread safety:** Must be `Send + Sync` as it's shared across all compactions.
+
+**Called when:** Each compaction job starts or resumes. If a compaction is interrupted and resumed, this is called again with a new filter instance.
+
+## Types
+
+### CompactionFilterDecision
+
+Decision returned by the filter for each entry.
+
+```rust
+pub enum CompactionFilterDecision {
+    Keep,
+    Drop,
+    Modify(ValueDeletable),
+}
+```
+
+**Variants:**
+
+#### `Keep`
+Keep the entry unchanged.
+
+#### `Drop`
+Drop the entry entirely from compaction output.
+
+<Warning>
+**Resurrection risk:** Dropping an entry removes it without leaving a tombstone. Older versions of the same key in lower LSM levels may become visible again. Only use when this is acceptable.
+
+**For merge operands:** Use `Drop` instead of `Modify(ValueDeletable::Tombstone)`. A tombstone would delete all previous merge operands for the key, while dropping just removes this operand from the merge chain.
+</Warning>
+
+#### `Modify(ValueDeletable)`
+Replace the entry's value. The key, sequence number, and `create_ts` remain unchanged.
+
+**Behavior by value type:**
+
+- **`Modify(ValueDeletable::Value(bytes))`**: Replace value with new bytes. The `expire_ts` is preserved.
+
+- **`Modify(ValueDeletable::Tombstone)`**: Convert entry to tombstone. The `expire_ts` is cleared (set to `None`). Use this instead of `Drop` to shadow older versions.
+
+- **`Modify(ValueDeletable::Merge(bytes))`**: Replace with merge operand. The `expire_ts` is preserved.
+
+### CompactionJobContext
+
+Read-only information about the current compaction job.
+
+```rust
+pub struct CompactionJobContext {
+    pub destination: u32,
+    pub is_dest_last_run: bool,
+    pub compaction_clock_tick: i64,
+    pub retention_min_seq: Option<u64>,
+}
+```
+
+**Fields:**
+
+- **`destination`**: Destination sorted run ID
+- **`is_dest_last_run`**: Whether destination is the last (oldest) run after compaction
+- **`compaction_clock_tick`**: Clock tick representing compaction time (for TTL decisions)
+- **`retention_min_seq`**: Minimum sequence number protected by active snapshots. Entries with `seq >= retention_min_seq` should not be dropped/modified to maintain snapshot consistency.
+
+### CompactionFilterError
+
+```rust
+pub enum CompactionFilterError {
+    CreationError(#[source] Box<dyn std::error::Error + Send + Sync>),
+    FilterError(#[source] Box<dyn std::error::Error + Send + Sync>),
+    CompactionEndError(#[source] Box<dyn std::error::Error + Send + Sync>),
+}
+```
+
+All variants abort the compaction when returned.
+
+## Implementation Examples
+
+### Prefix Tombstone Filter
+
+Convert entries with a specific key prefix to tombstones:
+
+```rust
+use async_trait::async_trait;
+use bytes::Bytes;
+use slatedb::{
+    CompactionFilter, CompactionFilterSupplier, CompactionJobContext,
+    CompactionFilterDecision, CompactionFilterError, RowEntry, ValueDeletable,
+};
+
+struct PrefixTombstoneFilter {
+    prefix: Bytes,
+    tombstone_count: u64,
+}
+
+#[async_trait]
+impl CompactionFilter for PrefixTombstoneFilter {
+    async fn filter(
+        &mut self,
+        entry: &RowEntry,
+    ) -> Result<CompactionFilterDecision, CompactionFilterError> {
+        if entry.key.starts_with(&self.prefix) {
+            self.tombstone_count += 1;
+            Ok(CompactionFilterDecision::Modify(ValueDeletable::Tombstone))
+        } else {
+            Ok(CompactionFilterDecision::Keep)
+        }
+    }
+
+    async fn on_compaction_end(&mut self) -> Result<(), CompactionFilterError> {
+        println!(
+            "Converted {} entries with prefix {:?} to tombstones",
+            self.tombstone_count,
+            self.prefix
+        );
+        Ok(())
+    }
+}
+
+struct PrefixTombstoneFilterSupplier {
+    prefix: Bytes,
+}
+
+#[async_trait]
+impl CompactionFilterSupplier for PrefixTombstoneFilterSupplier {
+    async fn create_compaction_filter(
+        &self,
+        _context: &CompactionJobContext,
+    ) -> Result<Box<dyn CompactionFilter>, CompactionFilterError> {
+        Ok(Box::new(PrefixTombstoneFilter {
+            prefix: self.prefix.clone(),
+            tombstone_count: 0,
+        }))
+    }
+}
+```
+
+### TTL-Based Filter
+
+Drop expired entries in the last sorted run:
+
+```rust
+struct TtlFilter {
+    now: i64,
+    is_last_run: bool,
+    dropped_count: u64,
+}
+
+#[async_trait]
+impl CompactionFilter for TtlFilter {
+    async fn filter(
+        &mut self,
+        entry: &RowEntry,
+    ) -> Result<CompactionFilterDecision, CompactionFilterError> {
+        // Only drop in last run to avoid resurrection
+        if self.is_last_run {
+            if let Some(expire_ts) = entry.expire_ts {
+                if expire_ts <= self.now {
+                    self.dropped_count += 1;
+                    return Ok(CompactionFilterDecision::Drop);
+                }
+            }
+        }
+        Ok(CompactionFilterDecision::Keep)
+    }
+
+    async fn on_compaction_end(&mut self) -> Result<(), CompactionFilterError> {
+        println!("Dropped {} expired entries", self.dropped_count);
+        Ok(())
+    }
+}
+
+struct TtlFilterSupplier;
+
+#[async_trait]
+impl CompactionFilterSupplier for TtlFilterSupplier {
+    async fn create_compaction_filter(
+        &self,
+        context: &CompactionJobContext,
+    ) -> Result<Box<dyn CompactionFilter>, CompactionFilterError> {
+        Ok(Box::new(TtlFilter {
+            now: context.compaction_clock_tick,
+            is_last_run: context.is_dest_last_run,
+            dropped_count: 0,
+        }))
+    }
+}
+```
+
+### Value Transformation Filter
+
+Modify entry values based on criteria:
+
+```rust
+struct ValueTransformFilter;
+
+#[async_trait]
+impl CompactionFilter for ValueTransformFilter {
+    async fn filter(
+        &mut self,
+        entry: &RowEntry,
+    ) -> Result<CompactionFilterDecision, CompactionFilterError> {
+        match &entry.value {
+            ValueDeletable::Value(bytes) => {
+                // Transform: uppercase all values
+                let uppercase = bytes.to_vec()
+                    .iter()
+                    .map(|b| b.to_ascii_uppercase())
+                    .collect::<Vec<_>>();
+                Ok(CompactionFilterDecision::Modify(
+                    ValueDeletable::Value(Bytes::from(uppercase))
+                ))
+            }
+            _ => Ok(CompactionFilterDecision::Keep),
+        }
+    }
+
+    async fn on_compaction_end(&mut self) -> Result<(), CompactionFilterError> {
+        Ok(())
+    }
+}
+```
+
+## Usage with Database
+
+Configure a compaction filter supplier when building the database:
+
+```rust
+use std::sync::Arc;
+use slatedb::Db;
+
+let supplier = Arc::new(PrefixTombstoneFilterSupplier {
+    prefix: Bytes::from_static(b"temp:"),
+});
+
+let db = Db::builder("mydb", object_store)
+    .with_compaction_filter_supplier(supplier)
+    .build()
+    .await?;
+```
+
+## Performance Considerations
+
+### Filter Method Performance
+
+The `filter()` method is called for **every entry** during compaction. For a compaction processing millions of entries:
+- Keep logic simple and fast
+- Avoid expensive I/O operations when possible
+- Use async I/O only when necessary
+
+### Dedicated Compaction Runtime
+
+For expensive filters, configure a dedicated compaction runtime:
+
+```rust
+let db = Db::builder("mydb", object_store)
+    .with_compaction_filter_supplier(expensive_filter)
+    .with_compaction_runtime(tokio::runtime::Handle::current())
+    .build()
+    .await?;
+```
+
+This prevents filter processing from blocking your application's main runtime.
+
+### Batching and State
+
+Since each filter instance is single-threaded per compaction job:
+- Maintain internal state for batching
+- Buffer outputs for batch writes in `on_compaction_end()`
+- Accumulate statistics efficiently
+
+## Best Practices
+
+### Snapshot Consistency
+
+<Warning>
+Respect `retention_min_seq` to maintain snapshot consistency:
+
+```rust
+async fn filter(
+    &mut self,
+    entry: &RowEntry,
+) -> Result<CompactionFilterDecision, CompactionFilterError> {
+    // Don't drop/modify entries protected by snapshots
+    if let Some(min_seq) = self.retention_min_seq {
+        if entry.seq >= min_seq {
+            return Ok(CompactionFilterDecision::Keep);
+        }
+    }
+    
+    // Filter logic for older entries...
+}
+```
+</Warning>
+
+### Drop vs Modify(Tombstone)
+
+- **Use `Drop`** for:
+  - Last sorted run entries (no resurrection risk)
+  - Merge operands you want to remove from chain
+  - Performance-critical paths (tombstones have overhead)
+
+- **Use `Modify(Tombstone)`** for:
+  - Non-last sorted runs (prevents resurrection)
+  - Explicitly deleting entries
+  - Ensuring older versions are hidden
+
+### Error Handling
+
+Return errors only for unrecoverable situations:
+
+```rust
+async fn filter(
+    &mut self,
+    entry: &RowEntry,
+) -> Result<CompactionFilterDecision, CompactionFilterError> {
+    // Recoverable: malformed data - keep it
+    let parsed = match parse_value(&entry.value) {
+        Ok(v) => v,
+        Err(_) => return Ok(CompactionFilterDecision::Keep),
+    };
+    
+    // Unrecoverable: critical external service failure
+    let decision = self.external_service.decide(parsed)
+        .await
+        .map_err(|e| CompactionFilterError::FilterError(Box::new(e)))?;
+    
+    Ok(decision)
+}
+```
+
+## Feature Flag
+
+Add to `Cargo.toml`:
+
+```toml
+[dependencies]
+slatedb = { version = "*", features = ["compaction_filters"] }
+```
+
+## See Also
+
+- [MergeOperator API](/api/merge-operator) - Custom merge operations
+- [WriteBatch API](/api/write-batch) - Batch write operations

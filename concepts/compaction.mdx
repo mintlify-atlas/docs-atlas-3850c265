@@ -1,0 +1,698 @@
+---
+title: Compaction
+description: Understanding SlateDB's size-tiered compaction strategy, background jobs, and optimization techniques
+---
+
+## What is Compaction?
+
+Compaction is the background process that merges multiple SSTable files to:
+1. **Remove deleted keys** (tombstones)
+2. **Consolidate overwrites** (keep only latest version)
+3. **Reduce read amplification** (fewer files to search)
+4. **Reclaim storage space** (eliminate duplicates)
+
+Without compaction, an LSM-tree would accumulate unbounded SSTs, making reads progressively slower and wasting storage.
+
+<Info>
+SlateDB uses **size-tiered compaction**, which balances write amplification (low) against read amplification (moderate). This makes it well-suited for write-heavy workloads common in embedded databases.
+</Info>
+
+## Compaction Architecture
+
+SlateDB's compaction system consists of three main components:
+
+### 1. Compaction Scheduler
+
+The scheduler decides **what** to compact:
+
+```rust
+pub trait CompactionScheduler {
+    fn next_compaction(
+        &mut self,
+        state: &CompactorState,
+    ) -> Result<Option<CompactionSpec>, Error>;
+}
+```
+
+**Source:** `slatedb/src/compactor.rs:100-110`
+
+The scheduler:
+- Analyzes current database state (L0 SSTs, sorted runs)
+- Proposes `CompactionSpec` values (what sources, what destination)
+- Validates logical invariants (consecutive sources, destination rules)
+- Applies back-pressure policies
+
+### 2. Compaction Executor
+
+The executor runs **how** to compact:
+
+```rust
+pub trait CompactionExecutor {
+    async fn execute(
+        &self,
+        args: StartCompactionJobArgs,
+    ) -> Result<CompactionJobResult, Error>;
+}
+```
+
+**Source:** `slatedb/src/compactor_executor.rs`
+
+The executor:
+- Opens and reads source SSTs/sorted runs
+- Merge-sorts entries from all sources
+- Applies compaction filters and merge operators
+- Writes output SSTs
+- Reports progress and completion
+
+### 3. Compactor Event Loop
+
+The event loop coordinates scheduler and executor:
+
+```rust
+pub struct Compactor {
+    state: Arc<RwLock<CompactorState>>,
+    scheduler: Box<dyn CompactionScheduler>,
+    executor: Arc<dyn CompactionExecutor>,
+    manifest_store: Arc<ManifestStore>,
+    // ...
+}
+```
+
+**Source:** `slatedb/src/compactor.rs:57-100`
+
+The loop:
+1. Polls manifest for updates
+2. Asks scheduler for next compaction
+3. Starts compaction jobs on executor
+4. Updates manifest with results
+5. Repeats
+
+**Source:** RFC 0002 (Compaction - High Level Overview)
+
+## Compaction Types
+
+### WAL → L0 Compaction
+
+The **writer process** compacts MemTables directly to L0:
+
+```rust
+impl MemtableFlushTask {
+    async fn flush_to_l0(&mut self) -> Result<Vec<SsTableHandle>, SlateDBError> {
+        let mut l0_ssts = Vec::new();
+        
+        for imm_memtable in &self.imm_memtables {
+            // Build SST from immutable MemTable (already sorted)
+            let sst = self.build_sst_from_memtable(imm_memtable).await?;
+            
+            // Write to compacted/ directory (not wal/)
+            let sst_id = SsTableId::Compacted(Ulid::new());
+            self.table_store.write_sst(sst_id, sst).await?;
+            
+            l0_ssts.push(SsTableHandle::new(sst_id, /* ... */));
+        }
+        
+        Ok(l0_ssts)
+    }
+}
+```
+
+**Source:** `slatedb/src/mem_table_flush.rs`, RFC 0002 (WAL->L0 Compaction)
+
+Key points:
+- **Done by writer**: Offloads work from compactor
+- **No merging**: MemTable is already sorted
+- **Direct from memory**: Doesn't read back from object storage
+- **ULID naming**: L0 SSTs use ULIDs, not sequential numbers
+
+<Note>
+**Why Writer Compacts to L0**: This splits network load between writer and compactor processes. The writer can flush directly from memory without reading back from object storage, saving both cost and bandwidth.
+</Note>
+
+### L0 → L1+ Compaction
+
+The **compactor process** merges L0 SSTs into sorted runs:
+
+```
+L0 SSTs: [SST-A, SST-B, SST-C, SST-D, SST-E, SST-F, SST-G, SST-H]
+                           |
+                           v
+                   [Merge & Sort]
+                           |
+                           v
+                 [New Sorted Run 100]
+```
+
+The compaction:
+1. Reads all L0 SSTs
+2. Merge-sorts all entries
+3. Writes new sorted run with multiple SSTs
+4. Updates manifest to move SSTs from L0 to sorted runs
+
+**Source:** RFC 0002 (Compacting Lower Levels)
+
+### Sorted Run Compactions
+
+Sorted runs within a logical level are periodically merged:
+
+```
+Level 1: [SR-100, SR-101, SR-102, SR-103]
+                    |
+                    v
+             [Merge Together]
+                    |
+                    v
+         Level 2: [SR-50]
+```
+
+## Size-Tiered Compaction Strategy
+
+SlateDB uses size-tiered compaction as its default (and currently only) strategy.
+
+### Core Idea
+
+Group sorted runs into logical levels based on size:
+
+```rust
+pub struct SizeTieredCompactionScheduler {
+    min_compaction_sources: usize,  // Default: 4
+    max_compaction_sources: usize,  // Default: 8
+    size_ratio_threshold: f32,       // Default: 0.25
+    // ...
+}
+```
+
+**Source:** `slatedb/src/size_tiered_compaction.rs:1-100`
+
+**Level boundaries:**
+- Level N contains runs of size S
+- Level N+1 contains runs of size ~S * (1 / size_ratio_threshold)
+- Example: L1 = 100MB, L2 = 400MB, L3 = 1.6GB
+
+### Compaction Trigger
+
+Compact a level when:
+
+```rust
+if num_runs_at_level >= min_compaction_sources {
+    schedule_compaction(level);
+}
+```
+
+**Example:**
+```
+L1: [SR-100, SR-101, SR-102, SR-103] (4 runs of ~100MB each)
+Trigger: min_compaction_sources = 4, so compact!
+
+Result:
+L1: []
+L2: [SR-50] (1 run of ~400MB)
+```
+
+**Source:** RFC 0002 (Size-Tiered Compaction Scheduler)
+
+### Compaction Algorithm
+
+```rust
+impl SizeTieredCompactionScheduler {
+    fn next_compaction(&mut self, state: &CompactorState) -> Option<CompactionSpec> {
+        // 1. Group sorted runs into levels by size
+        let levels = self.compute_levels(&state.sorted_runs);
+        
+        // 2. Find first level with >= min_compaction_sources runs
+        for level in levels.iter() {
+            if level.runs.len() >= self.min_compaction_sources {
+                // 3. Compact all runs in this level
+                return Some(CompactionSpec {
+                    sources: level.runs.clone(),
+                    destination: self.next_sr_id(),
+                });
+            }
+        }
+        
+        None
+    }
+}
+```
+
+**Source:** `slatedb/src/size_tiered_compaction.rs`
+
+### Level Calculation
+
+Levels are computed dynamically based on sorted run sizes:
+
+```rust
+fn compute_levels(&self, runs: &[SortedRun]) -> Vec<Level> {
+    let mut levels = Vec::new();
+    let mut current_level = Vec::new();
+    let mut current_size = 0;
+    
+    for run in runs.iter().sorted_by_key(|r| r.size()) {
+        if current_size > 0 && 
+           run.size() > current_size * (1.0 + self.size_ratio_threshold) {
+            // This run is too big, start new level
+            levels.push(Level { runs: current_level });
+            current_level = vec![run];
+            current_size = run.size();
+        } else {
+            current_level.push(run);
+            current_size = max(current_size, run.size());
+        }
+    }
+    
+    if !current_level.is_empty() {
+        levels.push(Level { runs: current_level });
+    }
+    
+    levels
+}
+```
+
+**Source:** `slatedb/src/size_tiered_compaction.rs`
+
+## Merge Execution
+
+### Merge-Sort Algorithm
+
+Compaction merge-sorts entries from multiple sources:
+
+```rust
+impl CompactionExecutor {
+    async fn merge_sources(
+        &self,
+        sources: Vec<SourceId>,
+    ) -> Result<Vec<RowEntry>, Error> {
+        // 1. Create iterator for each source
+        let mut iters: Vec<Box<dyn RowEntryIterator>> = Vec::new();
+        for source in sources {
+            match source {
+                SourceId::L0Sst(id) => {
+                    let sst = self.table_store.open_sst(id).await?;
+                    iters.push(Box::new(sst.iter()));
+                }
+                SourceId::SortedRun(id) => {
+                    let sr = self.sorted_run_store.open(id).await?;
+                    iters.push(Box::new(sr.iter()));
+                }
+            }
+        }
+        
+        // 2. Use merge iterator
+        let mut merge_iter = MergeIterator::new(iters);
+        let mut result = Vec::new();
+        
+        while let Some(entry) = merge_iter.next().await? {
+            result.push(entry);
+        }
+        
+        Ok(result)
+    }
+}
+```
+
+**Source:** `slatedb/src/compactor_executor.rs`
+
+### Deduplication
+
+When merging, keep only the latest version of each key:
+
+```rust
+struct DeduplicatingIterator {
+    inner: Box<dyn RowEntryIterator>,
+    last_key: Option<Bytes>,
+}
+
+impl DeduplicatingIterator {
+    async fn next(&mut self) -> Result<Option<RowEntry>, Error> {
+        while let Some(entry) = self.inner.next().await? {
+            if Some(&entry.key) != self.last_key.as_ref() {
+                self.last_key = Some(entry.key.clone());
+                return Ok(Some(entry));
+            }
+            // Skip duplicate (older version)
+        }
+        Ok(None)
+    }
+}
+```
+
+### Tombstone Removal
+
+Delete tombstones during compaction to bottom level:
+
+```rust
+if is_last_level && entry.is_tombstone() {
+    // Don't include tombstone in output
+    continue;
+}
+```
+
+<Tip>
+Tombstones (deleted keys) must be preserved in non-last levels to "shadow" older versions in lower levels. Only the bottom level can safely remove tombstones.
+</Tip>
+
+### Building Output SSTs
+
+```rust
+impl CompactionExecutor {
+    async fn build_output_ssts(
+        &self,
+        entries: Vec<RowEntry>,
+        target_sst_size: usize,
+    ) -> Result<Vec<EncodedSsTable>, Error> {
+        let mut result = Vec::new();
+        let mut builder = EncodedSsTableBuilder::new(/* ... */);
+        
+        for entry in entries {
+            if !builder.would_fit(&entry) {
+                // Current SST full, finish it
+                result.push(builder.build()?);
+                builder = EncodedSsTableBuilder::new(/* ... */);
+            }
+            builder.add(entry)?;
+        }
+        
+        if !builder.is_empty() {
+            result.push(builder.build()?);
+        }
+        
+        Ok(result)
+    }
+}
+```
+
+**Source:** `slatedb/src/sst_builder.rs`
+
+## Manifest Updates
+
+After compaction completes, update the manifest atomically:
+
+```rust
+impl Compactor {
+    async fn commit_compaction(
+        &self,
+        compaction: &Compaction,
+        output_ssts: Vec<SsTableHandle>,
+    ) -> Result<(), Error> {
+        loop {
+            let current_manifest = self.manifest_store.read_current().await?;
+            
+            let mut new_manifest = current_manifest.clone();
+            
+            // Remove source SSTs/runs
+            for source in &compaction.spec.sources {
+                new_manifest.remove_source(source);
+            }
+            
+            // Add destination sorted run
+            new_manifest.add_sorted_run(SortedRun {
+                id: compaction.spec.destination,
+                ssts: output_ssts.clone(),
+            });
+            
+            // Atomic CAS update
+            match self.manifest_store.write_manifest(
+                new_manifest,
+                Some(current_manifest.id)
+            ).await {
+                Ok(_) => return Ok(()),
+                Err(ManifestError::CasFailed) => {
+                    // Retry with updated manifest
+                    continue;
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+    }
+}
+```
+
+**Source:** `slatedb/src/compactor.rs`, RFC 0002 (Manifest Updates)
+
+<Note>
+**CAS Retry Loop**: If the manifest changes while compaction is running (e.g., new L0 SSTs arrive), the CAS update fails. The compactor retries with the updated manifest. This ensures compactions don't conflict with concurrent writes.
+</Note>
+
+## Back-Pressure
+
+SlateDB applies back-pressure to prevent unbounded growth:
+
+### L0 Back-Pressure
+
+```rust
+if state.l0.len() >= settings.l0_max_ssts {
+    // Block new writes until compaction catches up
+    self.pause_writes();
+}
+```
+
+**Source:** RFC 0002 (Back-Pressure)
+
+**Trigger**: `l0_max_ssts` (default: 16)
+
+**Effect**: Writer pauses until compaction reduces L0 count below threshold
+
+### Level Back-Pressure
+
+```rust
+if level_n_runs >= level_max_runs {
+    // Don't schedule compactions to this level
+    return None;
+}
+```
+
+**Trigger**: `level_max_runs` (default: 16)
+
+**Effect**: Scheduler won't compact into this level until lower level compacts
+
+<Info>
+**Cascading Back-Pressure**: If L2 is full, L1 can't compact. If L1 can't compact, L0 fills up. If L0 fills up, writes pause. This creates a natural flow control mechanism.
+</Info>
+
+## Amplification Analysis
+
+### Write Amplification
+
+**Size-tiered compaction formula:**
+```
+Write Amplification = O(log_T(N)) * T
+```
+
+Where:
+- N = database size
+- T = compaction threshold (`min_compaction_sources`)
+
+**Example:**
+- Database: 1TB
+- T = 4 (compact 4 runs together)
+- Levels: log₄(1TB / 10MB) ≈ 8
+- Write Amp: 8 * 4 = 32x
+
+**Source:** RFC 0002 (Amplification)
+
+### Read Amplification
+
+**Worst case:**
+```
+Read Amplification = O(log_T(N)) * T
+```
+
+**Bloom filter mitigation:**
+```
+Effective Read Amp = (# of levels) + (false positive rate * # of runs)
+                   ≈ 8 + (0.01 * 32) ≈ 9 SST reads
+```
+
+<Tip>
+SlateDB's bloom filters reduce read amplification from ~32 SST reads to ~9 SST reads for a typical configuration. This makes size-tiered compaction practical for read workloads.
+</Tip>
+
+### Space Amplification
+
+**Formula:**
+```
+Space Amplification = 1 + (T - 1) / T + ... ≈ 1 + log_T(N)
+```
+
+**Example:**
+- T = 4
+- Space Amp ≈ 1 + 8 = 9x
+
+Meaning: Database uses ~9x more space than just live data.
+
+**Mitigation:**
+- Object storage is cheap (~$0.023/GB)
+- Space amplification is temporary (compaction reclaims it)
+- Can use lifecycle policies to archive old SSTs
+
+## Compaction Filters
+
+Apply custom logic during compaction:
+
+```rust
+pub trait CompactionFilter {
+    fn filter(&self, key: &[u8], value: &[u8]) -> CompactionFilterDecision;
+}
+
+pub enum CompactionFilterDecision {
+    Keep,
+    Remove,
+    ChangeValue(Bytes),
+}
+```
+
+**Source:** `slatedb/src/compaction_filter.rs`
+
+**Use cases:**
+- **TTL expiration**: Remove expired keys
+- **Data sanitization**: Redact sensitive data
+- **Format migration**: Update value format
+- **Conditional deletion**: Remove based on value content
+
+**Example:**
+```rust
+struct TtlFilter {
+    now: i64,
+}
+
+impl CompactionFilter for TtlFilter {
+    fn filter(&self, key: &[u8], value: &[u8]) -> CompactionFilterDecision {
+        if let Some(expire_ts) = extract_expire_ts(value) {
+            if expire_ts < self.now {
+                return CompactionFilterDecision::Remove;
+            }
+        }
+        CompactionFilterDecision::Keep
+    }
+}
+```
+
+## Merge Operators
+
+Combine multiple values for the same key:
+
+```rust
+pub trait MergeOperator {
+    fn merge(
+        &self,
+        key: &[u8],
+        existing: Option<&[u8]>,
+        operands: Vec<&[u8]>,
+    ) -> Result<Option<Bytes>, Error>;
+}
+```
+
+**Source:** `slatedb/src/merge_operator.rs`, RFC 0006
+
+**Use cases:**
+- **Counters**: Sum all increments
+- **Sets**: Union of all additions
+- **Lists**: Append all elements
+
+**Example:**
+```rust
+struct CounterMerge;
+
+impl MergeOperator for CounterMerge {
+    fn merge(
+        &self,
+        _key: &[u8],
+        existing: Option<&[u8]>,
+        operands: Vec<&[u8]>,
+    ) -> Result<Option<Bytes>, Error> {
+        let mut sum = existing
+            .map(|v| i64::from_le_bytes(v.try_into().unwrap()))
+            .unwrap_or(0);
+        
+        for op in operands {
+            sum += i64::from_le_bytes(op.try_into().unwrap());
+        }
+        
+        Ok(Some(Bytes::from(sum.to_le_bytes().to_vec())))
+    }
+}
+```
+
+## Configuration
+
+Key compaction settings:
+
+```rust
+pub struct CompactorOptions {
+    pub max_compactions: usize,  // Default: 4
+    pub compaction_scheduler: CompactionSchedulerSupplier,
+    pub compaction_scheduler_tiered: SizeTieredCompactionSchedulerOptions,
+}
+
+pub struct SizeTieredCompactionSchedulerOptions {
+    pub min_compaction_sources: usize,  // Default: 4
+    pub max_compaction_sources: usize,  // Default: 8  
+    pub max_level: usize,  // Default: 8
+    pub size_ratio_threshold: f32,  // Default: 0.25
+}
+```
+
+**Source:** `slatedb/src/config.rs`, RFC 0002 (DB Options)
+
+### Tuning Recommendations
+
+**Write-heavy workload:**
+```rust
+SizeTieredCompactionSchedulerOptions {
+    min_compaction_sources: 8,  // Reduce write amplification
+    size_ratio_threshold: 0.5,  // More tolerance for size differences
+    // ...
+}
+```
+
+**Read-heavy workload:**
+```rust
+SizeTieredCompactionSchedulerOptions {
+    min_compaction_sources: 4,  // Reduce read amplification
+    size_ratio_threshold: 0.15, // Tighter size bounds
+    // ...
+}
+```
+
+**Balanced:**
+```rust
+SizeTieredCompactionSchedulerOptions::default()  // Good starting point
+```
+
+## Running the Compactor
+
+### Embedded Mode (Default)
+
+Compactor runs in the same process as writer:
+
+```rust
+let db = Db::open("my-db", object_store).await?;
+// Compactor automatically starts in background
+```
+
+### Standalone Mode
+
+Compactor runs in separate process:
+
+```rust
+let compactor = CompactorBuilder::new()
+    .object_store(object_store)
+    .manifest_store(manifest_store)
+    .build()
+    .await?;
+
+compactor.run().await?;
+```
+
+**Source:** `slatedb/src/db/builder.rs`, RFC 0002 (Running the Compactor)
+
+**Benefits of standalone mode:**
+- **Resource isolation**: Compaction doesn't affect write latency
+- **Scalability**: Can use larger instance for compaction
+- **Flexibility**: Can run compactor on-demand or scheduled
+
+## Next Steps
+
+- Learn about [LSM-tree fundamentals](/concepts/lsm-tree)
+- Understand [Object Storage trade-offs](/concepts/object-storage)
+- Explore [WAL durability](/concepts/wal)
+- Read [Architecture overview](/concepts/architecture)

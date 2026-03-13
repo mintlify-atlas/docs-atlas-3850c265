@@ -1,0 +1,448 @@
+---
+title: LSM-Tree
+description: Understanding log-structured merge-trees, levels, SSTables, and MemTables in SlateDB
+---
+
+## What is an LSM-Tree?
+
+A Log-Structured Merge-Tree (LSM-tree) is a data structure optimized for write-heavy workloads. Rather than updating data in-place (like B-trees), LSM-trees append all writes to a log and periodically merge them in the background. This design trades increased read complexity for dramatically faster writes.
+
+<Info>
+SlateDB implements a full LSM-tree on object storage, making it the first embedded database designed specifically for cloud object stores like S3, GCS, and Azure Blob Storage.
+</Info>
+
+## Core LSM Components
+
+### MemTable
+
+The MemTable is an in-memory data structure that receives all incoming writes.
+
+**SlateDB Implementation:**
+
+```rust
+pub(crate) struct KVTable {
+    map: Arc<SkipMap<SequencedKey, RowEntry>>,
+    durable: WatchableOnceCell<Result<(), SlateDBError>>,
+    entries_size_in_bytes: AtomicUsize,
+    last_tick: AtomicI64,
+    last_seq: AtomicU64,
+    seq_tracker: Arc<SequenceTracker>,
+}
+```
+
+**Source:** `slatedb/src/mem_table.rs:91-100`
+
+Key characteristics:
+- **Ordered Structure**: Uses a `SkipMap` (skip list) for O(log n) insertions and lookups
+- **Multiple Versions**: Keys are stored with sequence numbers, allowing multiple versions per user key
+- **Size Tracking**: Monitors memory usage to know when to flush
+- **Durability Notification**: `WatchableOnceCell` allows callers to wait for flush completion
+
+**Sequenced Keys:**
+
+```rust
+pub(crate) struct SequencedKey {
+    pub(crate) user_key: Bytes,
+    pub(crate) seq: u64,
+}
+
+impl Ord for SequencedKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.user_key
+            .cmp(&other.user_key)
+            .then(self.seq.cmp(&other.seq).reverse())
+    }
+}
+```
+
+**Source:** `slatedb/src/mem_table.rs:25-42`
+
+<Note>
+Keys are ordered first by user key, then by sequence number in **reverse** order. This ensures that when reading, the most recent version (highest sequence number) is encountered first.
+</Note>
+
+### Immutable MemTables
+
+When a MemTable reaches the configured size, it becomes immutable:
+
+```rust
+pub(crate) struct DbState {
+    pub(crate) memtable: Arc<KVTable>,
+    pub(crate) imm_memtables: Vec<Arc<ImmutableMemtable>>,
+    // ...
+}
+```
+
+**Source:** `slatedb/src/db_state.rs`
+
+1. The current MemTable is frozen and moved to `imm_memtables`
+2. A new empty MemTable is created for new writes
+3. Background threads flush immutable MemTables to object storage as SSTs
+4. Once flushed and acknowledged, the immutable MemTable is dropped
+
+### SSTable (Sorted String Table)
+
+SSTs are immutable, sorted files containing key-value pairs. SlateDB stores SSTs in object storage.
+
+**SST Structure:**
+
+```
++------------------+
+| Data Block 0     |
++------------------+
+| Data Block 1     |
++------------------+
+| ...              |
++------------------+
+| Data Block N     |
++------------------+
+| Bloom Filter     |
++------------------+
+| Index Block      |
++------------------+
+| Footer           |
++------------------+
+```
+
+**Footer Structure:**
+
+```rust
+// 8 bytes for metadata offset + 2 bytes for version
+const NUM_FOOTER_BYTES: usize = 10;
+const SST_FORMAT_VERSION: u16 = 1;
+const SST_FORMAT_VERSION_V2: u16 = 2;
+```
+
+**Source:** `slatedb/src/format/sst.rs:24-30`
+
+#### Data Blocks
+
+Data blocks contain the actual key-value pairs, organized for efficient access:
+
+**Block Format V2** (latest):
+
+```rust
+pub(crate) struct BlockBuilderV2 {
+    block_size: usize,
+    restart_interval: usize,
+    restarts: Vec<u32>,
+    entries: Vec<RowEntry>,
+    // ...
+}
+```
+
+**Source:** `slatedb/src/format/block_v2.rs`
+
+- **Restart Points**: Periodic full keys to enable binary search within a block
+- **Prefix Compression**: Keys share common prefixes with previous keys
+- **Restart Interval**: Controls compression vs. search efficiency trade-off
+
+#### Bloom Filters
+
+Bloom filters are probabilistic data structures that quickly determine if a key is NOT in an SST:
+
+```rust
+pub(crate) struct BloomFilter {
+    bits: Bytes,
+    k: u32,
+}
+```
+
+**Source:** `slatedb/src/filter.rs`
+
+<Tip>
+**False Positive Rate**: Bloom filters may return false positives ("key might exist") but never false negatives. This makes them ideal for avoiding expensive object storage reads. SlateDB configures filters with ~1% false positive rate by default.
+</Tip>
+
+Configuration:
+```rust
+min_filter_keys: 100,  // Don't create filter for small SSTs
+filter_bits_per_key: 10,  // Controls false positive rate
+```
+
+#### Index Block
+
+The index maps key ranges to data block offsets:
+
+```rust
+pub struct SsTableInfo {
+    pub(crate) first_entry: Option<Bytes>,
+    pub(crate) last_entry: Option<Bytes>,
+    pub(crate) index_offset: u64,
+    pub(crate) index_len: u64,
+    pub(crate) filter_offset: u64,
+    pub(crate) filter_len: u64,
+    // ...
+}
+```
+
+**Source:** `slatedb/src/db_state.rs`
+
+The index enables:
+1. **Binary search** to find which block contains a key
+2. **Range queries** by identifying relevant blocks
+3. **Efficient caching** of frequently accessed metadata
+
+## LSM Levels in SlateDB
+
+SlateDB organizes SSTs into multiple levels:
+
+### Level 0 (L0)
+
+L0 contains recently flushed MemTables:
+
+```rust
+pub struct ManifestCore {
+    pub(crate) l0: VecDeque<SsTableHandle>,
+    // ...
+}
+```
+
+**Source:** RFC 0001
+
+Characteristics:
+- **Overlapping key ranges**: Each L0 SST can contain any key
+- **Time-ordered**: Newer SSTs appear first in the list
+- **Full key range**: Each SST spans the entire keyspace
+- **WAL origin**: L0 SSTs are flushed from MemTables without merge
+
+**Why L0 overlaps:**
+
+Each MemTable flush creates a complete snapshot of recently written keys. Without merging, these SSTs naturally overlap. This is acceptable because:
+1. L0 is small (limited by `l0_max_ssts`)
+2. Compaction quickly merges L0 into lower levels
+3. Bloom filters minimize read overhead
+
+### Compacted Levels (L1+)
+
+Compacted levels use Sorted Runs:
+
+```rust
+pub struct SortedRun {
+    pub(crate) id: u32,
+    pub(crate) ssts: Vec<SsTableHandle>,
+}
+
+pub struct ManifestCore {
+    pub(crate) compacted: Vec<SortedRun>,
+    // ...
+}
+```
+
+**Source:** `slatedb/src/db_state.rs`, RFC 0002
+
+Characteristics:
+- **Non-overlapping SSTs**: Each SST in a sorted run covers a distinct key range
+- **Full keyspace coverage**: A sorted run spans the complete key range
+- **Age-ordered**: Sorted runs are ordered by age (newest first)
+- **ULID naming**: SSTs use ULIDs for unique identification
+
+<Info>
+**Why Sorted Runs?**: Rather than using large monolithic SSTs, SlateDB breaks each level into multiple smaller SSTs (a "sorted run"). This keeps metadata blocks small enough to cache effectively and simplifies partial reads.
+</Info>
+
+### Size-Tiered Organization
+
+SlateDB uses size-tiered compaction to organize sorted runs into logical levels:
+
+```rust
+pub struct SizeTieredCompactionScheduler {
+    min_compaction_sources: usize,
+    max_compaction_sources: usize,
+    max_level: usize,
+    size_ratio_threshold: f32,
+    // ...
+}
+```
+
+**Source:** `slatedb/src/size_tiered_compaction.rs:1-100`
+
+Size tiers work as follows:
+1. **Level boundaries**: Determined by SST size ratios
+2. **Compaction trigger**: When too many similar-sized runs accumulate
+3. **Merge strategy**: All runs in a level compact together into the next level
+4. **Size growth**: Each level is ~`size_ratio_threshold` times larger than the previous
+
+**Example:**
+```
+L0: [SST-A, SST-B, SST-C] (each 10MB)
+L1: [SR-100] (100MB, containing multiple 10MB SSTs)
+L2: [SR-50, SR-51] (each 1GB, containing multiple 100MB SSTs)
+```
+
+## Read Path Through Levels
+
+Reads search from newest to oldest data:
+
+```
+1. Check MemTable
+2. Check Immutable MemTables (in order)
+3. Check L0 SSTs (in order, using bloom filters)
+4. Check Sorted Runs (in order, using bloom filters)
+   - Binary search within each run to find relevant SST
+   - Use bloom filter before reading SST
+   - Binary search within SST blocks
+```
+
+**Implementation:**
+
+```rust
+pub(crate) async fn get_core(&self, key: &[u8]) -> Result<Option<Value>, SlateDBError> {
+    // Check MemTable
+    if let Some(value) = self.state.read().memtable.get(key) {
+        return Ok(Some(value));
+    }
+    
+    // Check immutable MemTables
+    for imm in &self.state.read().imm_memtables {
+        if let Some(value) = imm.get(key) {
+            return Ok(Some(value));
+        }
+    }
+    
+    // Check L0 and compacted levels
+    self.reader.get(key, &self.state.read()).await
+}
+```
+
+**Source:** `slatedb/src/db_read.rs`
+
+<Note>
+**Bloom Filter Benefits**: For a database with 8 sorted runs and 10MB/SST with 100k keys each, bloom filters save ~7 SST reads per point query on average (assuming 1% false positive rate).
+</Note>
+
+## Range Queries
+
+Range scans must merge-sort data from all levels:
+
+```rust
+pub(crate) struct MergeIterator {
+    iters: Vec<Box<dyn RowEntryIterator>>,
+    heap: BinaryHeap<MergeEntry>,
+}
+```
+
+**Source:** `slatedb/src/merge_iterator.rs`
+
+Steps:
+1. Create iterators for MemTable, immutable MemTables, L0 SSTs, and each sorted run
+2. Use a min-heap to merge-sort entries from all iterators
+3. Apply sequence number filtering (keep most recent version)
+4. Skip tombstones (deleted keys)
+
+## Write Path and LSM Evolution
+
+### Write Flow
+
+```
+put(key, value)
+     |
+     v
+[Add to MemTable]
+     |
+     v
+MemTable full?
+     |
+     v
+[Freeze MemTable -> Immutable]
+     |
+     v
+[Create new MemTable]
+     |
+     v
+[Background: Flush Immutable to L0]
+     |
+     v
+[Update Manifest via CAS]
+     |
+     v
+[Acknowledge put() future]
+```
+
+### Flush to L0
+
+```rust
+impl MemtableFlushTask {
+    async fn write_l0_ssts(&mut self) -> Result<Vec<SsTableHandle>, SlateDBError> {
+        let mut l0_ssts = Vec::new();
+        
+        for imm in &self.imm_memtables {
+            let mut builder = EncodedSsTableBuilder::new(/* ... */);
+            
+            // Write all entries from immutable MemTable
+            for entry in imm.iter() {
+                builder.add(entry)?;
+            }
+            
+            // Encode and write to object storage
+            let encoded_sst = builder.build()?;
+            let id = self.table_store.write_sst(encoded_sst).await?;
+            
+            l0_ssts.push(SsTableHandle::new(id, /* ... */));
+        }
+        
+        Ok(l0_ssts)
+    }
+}
+```
+
+**Source:** `slatedb/src/mem_table_flush.rs`
+
+## Compaction
+
+Compaction merges SSTs to:
+1. Remove deleted/overwritten keys
+2. Reduce read amplification
+3. Maintain level invariants
+
+See the [Compaction](/concepts/compaction) page for detailed information.
+
+## Sequence Numbers and MVCC
+
+SlateDB uses sequence numbers for multi-version concurrency control:
+
+```rust
+pub struct SequenceTracker {
+    seq: AtomicU64,
+}
+
+impl SequenceTracker {
+    pub fn next_seq(&self) -> u64 {
+        self.seq.fetch_add(1, Ordering::SeqCst)
+    }
+}
+```
+
+**Source:** `slatedb/src/seq_tracker.rs`
+
+Sequence numbers enable:
+- **Snapshot isolation**: Readers see consistent snapshots
+- **Version ordering**: Determine which value is newest
+- **Tombstone handling**: Track when keys were deleted
+
+## Trade-offs
+
+### Advantages of LSM-Trees
+
+✅ **Write Performance**: Sequential writes to append-only structures
+✅ **Space Efficiency**: Compression works well on sorted data  
+✅ **Scalability**: Levels grow geometrically
+✅ **Object Storage Fit**: Large sequential writes match object storage model
+
+### Disadvantages of LSM-Trees
+
+❌ **Read Amplification**: Must check multiple levels
+❌ **Write Amplification**: Data rewritten during compaction
+❌ **Space Amplification**: Multiple versions exist temporarily
+❌ **Compaction Overhead**: Background work competes for resources
+
+<Tip>
+SlateDB mitigates these disadvantages through aggressive caching (block cache, disk cache), bloom filters, and optimized size-tiered compaction. See [Compaction Strategies](/concepts/compaction) for details.
+</Tip>
+
+## Next Steps
+
+- Learn about [Object Storage](/concepts/object-storage) trade-offs
+- Understand [WAL durability](/concepts/wal) guarantees  
+- Explore [Compaction strategies](/concepts/compaction)
+- Read [Architecture](/concepts/architecture) overview

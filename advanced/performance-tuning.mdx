@@ -1,0 +1,560 @@
+---
+title: Performance Tuning
+description: Optimize SlateDB performance for your workload through cache sizing, compaction tuning, and WAL configuration
+---
+
+SlateDB provides extensive configuration options to optimize performance for different workloads. This guide covers cache sizing, compaction tuning, WAL configuration, and other advanced performance optimizations.
+
+## Cache Configuration
+
+### Block Cache
+
+The block cache stores decompressed SST data blocks in memory, significantly improving read performance.
+
+```rust
+use slatedb::{Db, db_cache::SplitCache};
+use std::sync::Arc;
+
+#[cfg(feature = "foyer")]
+use slatedb::db_cache::foyer::{FoyerCache, FoyerCacheOptions};
+
+// Configure block cache (Foyer)
+let block_cache_opts = FoyerCacheOptions {
+    max_capacity: 512 * 1024 * 1024,  // 512 MiB
+    ..Default::default()
+};
+let block_cache = Arc::new(FoyerCache::new_with_opts(block_cache_opts));
+
+let db = Db::builder("/tmp/mydb", object_store)
+    .with_db_cache(Arc::new(
+        SplitCache::new()
+            .with_block_cache(Some(block_cache))
+            .build()
+    ))
+    .build()
+    .await?;
+```
+
+### Meta Cache
+
+The meta cache stores SST indices, bloom filters, and statistics:
+
+```rust
+#[cfg(feature = "foyer")]
+use slatedb::db_cache::foyer::{FoyerCache, FoyerCacheOptions};
+
+let meta_cache_opts = FoyerCacheOptions {
+    max_capacity: 128 * 1024 * 1024,  // 128 MiB
+    ..Default::default()
+};
+let meta_cache = Arc::new(FoyerCache::new_with_opts(meta_cache_opts));
+
+let db = Db::builder("/tmp/mydb", object_store)
+    .with_db_cache(Arc::new(
+        SplitCache::new()
+            .with_meta_cache(Some(meta_cache))
+            .build()
+    ))
+    .build()
+    .await?;
+```
+
+### Default Cache Sizes
+
+SlateDB provides sensible defaults:
+
+```rust
+// Default cache capacities
+const DEFAULT_BLOCK_CACHE_CAPACITY: u64 = 512 * 1024 * 1024;  // 512 MiB
+const DEFAULT_META_CACHE_CAPACITY: u64 = 128 * 1024 * 1024;   // 128 MiB
+```
+
+### Sizing Guidelines
+
+**Block Cache**:
+- **Read-heavy workloads**: 30-50% of working set size
+- **Write-heavy workloads**: 10-20% of working set size
+- **Mixed workloads**: 20-40% of working set size
+
+**Meta Cache**:
+- Generally 20-25% of block cache size
+- Increase if you have many small SSTables
+- Decrease for workloads with large, uniform SSTables
+
+```rust
+use slatedb::config::Settings;
+
+fn calculate_cache_sizes(working_set_gb: u64, read_ratio: f64) -> (u64, u64) {
+    let working_set_bytes = working_set_gb * 1024 * 1024 * 1024;
+    
+    // Block cache: scale with read ratio
+    let block_cache_ratio = 0.1 + (read_ratio * 0.4);
+    let block_cache = (working_set_bytes as f64 * block_cache_ratio) as u64;
+    
+    // Meta cache: 25% of block cache
+    let meta_cache = block_cache / 4;
+    
+    (block_cache, meta_cache)
+}
+
+// Example: 10GB working set, 70% reads
+let (block_cache, meta_cache) = calculate_cache_sizes(10, 0.7);
+println!("Block cache: {} MiB", block_cache / 1024 / 1024);
+println!("Meta cache: {} MiB", meta_cache / 1024 / 1024);
+```
+
+### Cache Implementation Choice
+
+SlateDB supports multiple cache implementations:
+
+```toml
+# Foyer (default) - Best for most workloads
+[dependencies]
+slatedb = { version = "*", features = ["foyer"] }
+
+# Moka - Alternative in-memory cache
+slatedb = { version = "*", features = ["moka"], default-features = false }
+```
+
+**Foyer** (recommended):
+- Lower memory overhead
+- Better eviction policies
+- Supports hybrid memory + disk caching
+
+**Moka**:
+- Simpler implementation
+- Good for smaller caches
+
+## Object Store Cache
+
+The object store cache stores SST data on local disk:
+
+```rust
+use slatedb::config::{Settings, ObjectStoreCacheOptions, PreloadLevel};
+use std::time::Duration;
+
+let mut settings = Settings::default();
+settings.object_store_cache_options = ObjectStoreCacheOptions {
+    // Enable disk cache
+    root_folder: Some("/var/cache/slatedb".into()),
+    
+    // Maximum cache size (16 GiB default on 64-bit systems)
+    max_cache_size_bytes: Some(16 * 1024 * 1024 * 1024),
+    
+    // Part size for cached blocks (4 MiB default)
+    part_size_bytes: 4 * 1024 * 1024,
+    
+    // Cache write operations
+    cache_puts: true,
+    
+    // Preload SSTs on startup
+    preload_disk_cache_on_startup: Some(PreloadLevel::L0Sst),
+    
+    // Cache directory scan interval
+    scan_interval: Some(Duration::from_secs(3600)),
+};
+
+let db = Db::builder("/tmp/mydb", object_store)
+    .with_settings(settings)
+    .build()
+    .await?;
+```
+
+### Disk Cache Guidelines
+
+- **Size**: 2-5x your block cache size
+- **Location**: Use fast local SSD storage
+- **Preloading**: Enable for read-heavy workloads
+- **Part size**: Keep at 4 MiB unless you have specific needs
+
+## Compaction Tuning
+
+### Basic Compaction Settings
+
+```rust
+use slatedb::config::{Settings, CompactorOptions, SizeTieredCompactionSchedulerOptions};
+use std::time::Duration;
+use std::collections::HashMap;
+
+let mut settings = Settings::default();
+
+if let Some(ref mut compactor_opts) = settings.compactor_options {
+    // Compaction check interval
+    compactor_opts.poll_interval = Duration::from_secs(5);
+    
+    // Maximum SST size for compacted runs
+    compactor_opts.max_sst_size = 256 * 1024 * 1024;  // 256 MiB
+    
+    // Number of concurrent compactions
+    compactor_opts.max_concurrent_compactions = 4;
+    
+    // Size-tiered scheduler options
+    let scheduler_opts = SizeTieredCompactionSchedulerOptions {
+        min_compaction_sources: 4,
+        max_compaction_sources: 8,
+        include_size_threshold: 4.0,
+    };
+    compactor_opts.scheduler_options = scheduler_opts.into();
+}
+
+let db = Db::builder("/tmp/mydb", object_store)
+    .with_settings(settings)
+    .build()
+    .await?;
+```
+
+### Size-Tiered Compaction Parameters
+
+**min_compaction_sources**: Minimum number of SSTables to compact together
+- Smaller (2-4): More frequent, smaller compactions
+- Larger (6-8): Less frequent, larger compactions
+- Trade-off: Write amplification vs. compaction frequency
+
+**max_compaction_sources**: Maximum number of SSTables to compact together
+- Controls worst-case compaction work
+- Typical: 1.5-2x min_compaction_sources
+
+**include_size_threshold**: Size ratio threshold for including SSTables
+- Controls which SSTables get compacted together
+- Smaller (2.0-3.0): More aggressive compaction
+- Larger (4.0-6.0): Less aggressive compaction
+
+```rust
+use std::collections::HashMap;
+
+// Write-heavy workload: aggressive compaction
+let write_heavy = HashMap::from([
+    ("min_compaction_sources".to_string(), "2".to_string()),
+    ("max_compaction_sources".to_string(), "4".to_string()),
+    ("include_size_threshold".to_string(), "2.0".to_string()),
+]);
+
+// Read-heavy workload: less aggressive compaction
+let read_heavy = HashMap::from([
+    ("min_compaction_sources".to_string(), "6".to_string()),
+    ("max_compaction_sources".to_string(), "10".to_string()),
+    ("include_size_threshold".to_string(), "5.0".to_string()),
+]);
+
+// Balanced workload (default)
+let balanced = HashMap::from([
+    ("min_compaction_sources".to_string(), "4".to_string()),
+    ("max_compaction_sources".to_string(), "8".to_string()),
+    ("include_size_threshold".to_string(), "4.0".to_string()),
+]);
+```
+
+### L0 SST Configuration
+
+```rust
+let mut settings = Settings::default();
+
+// Target size for L0 SSTables
+settings.l0_sst_size_bytes = 64 * 1024 * 1024;  // 64 MiB
+
+// Maximum number of L0 SSTables before backpressure
+settings.l0_max_ssts = 8;
+```
+
+**l0_sst_size_bytes** considerations:
+- **Larger (128-256 MiB)**:
+  - Fewer L0 SSTables
+  - Faster recovery (fewer files)
+  - More memory for memtable
+  - Slower for secondary readers
+- **Smaller (32-64 MiB)**:
+  - More L0 SSTables
+  - Faster visibility to secondary readers
+  - More compaction work
+
+**l0_max_ssts** considerations:
+- Controls write backpressure
+- Lower (4-6): More aggressive compaction, less read overhead
+- Higher (8-12): More write throughput, more read overhead
+
+## WAL Configuration
+
+### Flush Interval
+
+```rust
+use std::time::Duration;
+
+let mut settings = Settings::default();
+
+// Write latency vs. cost trade-off
+settings.flush_interval = Some(Duration::from_millis(100));
+
+let db = Db::builder("/tmp/mydb", object_store)
+    .with_settings(settings)
+    .build()
+    .await?;
+```
+
+**flush_interval** guidelines:
+- **100ms** (default): Good balance for most workloads
+- **50ms**: Lower latency, ~$260/month S3 PUT cost
+- **200ms**: Lower cost, higher latency, ~$65/month S3 PUT cost
+- **None**: Manual flushing only
+
+<Warning>
+Setting `flush_interval = None` disables automatic flushing. You must call `db.flush()` manually or data may be lost on crash.
+</Warning>
+
+### Unflushed Memory Limit
+
+```rust
+let mut settings = Settings::default();
+
+// Maximum unflushed data before backpressure
+settings.max_unflushed_bytes = 1_073_741_824;  // 1 GiB
+
+let db = Db::builder("/tmp/mydb", object_store)
+    .with_settings(settings)
+    .build()
+    .await?;
+```
+
+Controls backpressure when WAL and memtable flushes fall behind:
+- Includes both immutable WAL and memtable data
+- Writes block when exceeded
+- Balance between memory usage and write throughput
+
+### Disabling WAL (Advanced)
+
+<Warning>
+Disabling WAL reduces durability. Only use for non-critical data or if you have external durability mechanisms.
+</Warning>
+
+```rust
+#[cfg(feature = "wal_disable")]
+{
+    let mut settings = Settings::default();
+    settings.wal_enabled = false;
+    
+    let db = Db::builder("/tmp/mydb", object_store)
+        .with_settings(settings)
+        .build()
+        .await?;
+}
+```
+
+## Bloom Filter Tuning
+
+```rust
+let mut settings = Settings::default();
+
+// Bits per key (10 = ~0.82% false positive rate)
+settings.filter_bits_per_key = 10;
+
+// Minimum keys before creating a bloom filter
+settings.min_filter_keys = 1000;
+
+let db = Db::builder("/tmp/mydb", object_store)
+    .with_settings(settings)
+    .build()
+    .await?;
+```
+
+**filter_bits_per_key**:
+- **10 bits** (default): 0.82% FPR, 1.25 bytes per key
+- **12 bits**: 0.24% FPR, 1.5 bytes per key
+- **15 bits**: 0.03% FPR, 1.875 bytes per key
+
+**min_filter_keys**:
+- Skip bloom filter for small SSTables
+- Small SSTables are fast to scan anyway
+- Reduces metadata overhead
+
+## Compression
+
+```rust
+use slatedb::config::CompressionCodec;
+
+let mut settings = Settings::default();
+
+// Choose compression algorithm
+#[cfg(feature = "zstd")]
+{
+    settings.compression_codec = Some(CompressionCodec::Zstd);
+}
+
+let db = Db::builder("/tmp/mydb", object_store)
+    .with_settings(settings)
+    .build()
+    .await?;
+```
+
+Available codecs (requires feature flags):
+
+```toml
+[dependencies]
+slatedb = { version = "*", features = ["zstd"] }     # Best compression ratio
+slatedb = { version = "*", features = ["lz4"] }      # Fastest
+slatedb = { version = "*", features = ["snappy"] }   # Balanced
+slatedb = { version = "*", features = ["zlib"] }     # Good compatibility
+```
+
+**Compression trade-offs**:
+- **Zstd**: Best compression, moderate CPU
+- **LZ4**: Fast compression/decompression, lower ratio
+- **Snappy**: Balanced, widely supported
+- **None**: No compression, highest throughput
+
+## Dedicated Compaction Runtime
+
+Isolate compaction work from main application runtime:
+
+```rust
+use tokio::runtime::Handle;
+
+let compaction_runtime = tokio::runtime::Builder::new_multi_thread()
+    .worker_threads(4)
+    .thread_name("compaction")
+    .enable_all()
+    .build()?;
+
+let db = Db::builder("/tmp/mydb", object_store)
+    .with_compaction_runtime(compaction_runtime.handle().clone())
+    .build()
+    .await?;
+```
+
+Benefits:
+- Isolates compaction CPU usage
+- Prevents compaction from blocking application tasks
+- Better for CPU-intensive compaction filters
+
+## Complete Tuning Example
+
+Here's a complete example tuned for a write-heavy workload:
+
+```rust
+use slatedb::{Db, config::{Settings, CompactorOptions, ObjectStoreCacheOptions}};
+use slatedb::db_cache::{SplitCache};
+use std::time::Duration;
+use std::sync::Arc;
+
+#[cfg(feature = "foyer")]
+use slatedb::db_cache::foyer::{FoyerCache, FoyerCacheOptions};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let object_store = Arc::new(/* your object store */);
+    
+    // Block cache: moderate size for write-heavy
+    #[cfg(feature = "foyer")]
+    let block_cache = Arc::new(FoyerCache::new_with_opts(FoyerCacheOptions {
+        max_capacity: 256 * 1024 * 1024,  // 256 MiB
+        ..Default::default()
+    }));
+    
+    #[cfg(feature = "foyer")]
+    let meta_cache = Arc::new(FoyerCache::new_with_opts(FoyerCacheOptions {
+        max_capacity: 64 * 1024 * 1024,  // 64 MiB
+        ..Default::default()
+    }));
+    
+    let mut settings = Settings::default();
+    
+    // Fast WAL flushes
+    settings.flush_interval = Some(Duration::from_millis(50));
+    
+    // Larger L0 SSTables for fewer compactions
+    settings.l0_sst_size_bytes = 128 * 1024 * 1024;
+    settings.l0_max_ssts = 6;
+    
+    // Higher unflushed memory for write throughput
+    settings.max_unflushed_bytes = 2_147_483_648;  // 2 GiB
+    
+    // Aggressive compaction
+    if let Some(ref mut compactor_opts) = settings.compactor_options {
+        compactor_opts.max_concurrent_compactions = 6;
+        compactor_opts.max_sst_size = 512 * 1024 * 1024;
+        
+        use std::collections::HashMap;
+        compactor_opts.scheduler_options = HashMap::from([
+            ("min_compaction_sources".to_string(), "2".to_string()),
+            ("max_compaction_sources".to_string(), "4".to_string()),
+            ("include_size_threshold".to_string(), "2.5".to_string()),
+        ]);
+    }
+    
+    // Disk cache for better read performance
+    settings.object_store_cache_options = ObjectStoreCacheOptions {
+        root_folder: Some("/var/cache/slatedb".into()),
+        max_cache_size_bytes: Some(512 * 1024 * 1024),  // 512 MiB
+        part_size_bytes: 4 * 1024 * 1024,
+        cache_puts: true,
+        preload_disk_cache_on_startup: None,  // Skip preload for write-heavy
+        scan_interval: Some(Duration::from_secs(3600)),
+    };
+    
+    // Fast compression
+    #[cfg(feature = "lz4")]
+    {
+        settings.compression_codec = Some(slatedb::config::CompressionCodec::Lz4);
+    }
+    
+    let db = Db::builder("/tmp/mydb", object_store)
+        .with_settings(settings)
+        #[cfg(feature = "foyer")]
+        .with_db_cache(Arc::new(
+            SplitCache::new()
+                .with_block_cache(Some(block_cache))
+                .with_meta_cache(Some(meta_cache))
+                .build()
+        ))
+        .build()
+        .await?;
+    
+    Ok(())
+}
+```
+
+## Workload-Specific Tuning
+
+### Write-Heavy Workload
+
+```rust
+let settings = Settings {
+    flush_interval: Some(Duration::from_millis(50)),
+    l0_sst_size_bytes: 128 * 1024 * 1024,
+    l0_max_ssts: 6,
+    max_unflushed_bytes: 2_147_483_648,
+    ..Default::default()
+};
+// Smaller block cache, aggressive compaction, fast compression
+```
+
+### Read-Heavy Workload
+
+```rust
+let settings = Settings {
+    flush_interval: Some(Duration::from_millis(200)),
+    l0_sst_size_bytes: 64 * 1024 * 1024,
+    l0_max_ssts: 12,
+    filter_bits_per_key: 12,  // Lower false positive rate
+    ..Default::default()
+};
+// Large block cache, less aggressive compaction, better compression
+```
+
+### Balanced Workload
+
+Use the default settings as a starting point and adjust based on metrics.
+
+## Monitoring and Iteration
+
+1. **Start with defaults**: Begin with default settings
+2. **Monitor metrics**: Track latency, throughput, cache hit rates
+3. **Identify bottlenecks**: CPU, memory, network, or object store
+4. **Adjust incrementally**: Change one setting at a time
+5. **Measure impact**: Compare before/after metrics
+
+## Related Documentation
+
+- [Configuration Settings](/configuration/settings) - Complete configuration options
+- [Compactor Configuration](/configuration/compactor) - Compaction tuning options
+- [Caching Configuration](/configuration/caching) - Cache optimization settings
+- [Standalone Compactor](/advanced/standalone-compactor) - Isolate compaction work
+- [Compaction Filters](/advanced/compaction-filters) - Custom compaction logic

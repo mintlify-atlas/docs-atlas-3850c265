@@ -1,0 +1,289 @@
+---
+title: Architecture
+description: Understanding SlateDB's overall system design, components, and data flow
+---
+
+## Overview
+
+SlateDB is an embedded storage engine built as a log-structured merge-tree (LSM-tree) that writes data to object storage (S3, GCS, ABS, MinIO, Tigris, etc.) instead of local disk. This unique architecture provides bottomless storage capacity, high durability, and easy replication while managing the inherent trade-offs of object storage's higher latency and API costs.
+
+## Core Components
+
+SlateDB consists of several key components that work together to provide a durable, high-performance key-value store:
+
+### 1. Database State (DbState)
+
+The `DbState` structure maintains the current state of the database in memory:
+
+```rust
+pub(crate) struct DbState {
+    pub(crate) memtable: Arc<KVTable>,
+    pub(crate) imm_memtables: Vec<Arc<ImmutableMemtable>>,
+    pub(crate) l0: VecDeque<SsTableHandle>,
+    pub(crate) compacted: Vec<SortedRun>,
+    // ... other fields
+}
+```
+
+**Source:** `slatedb/src/db_state.rs`
+
+- **memtable**: The currently active mutable MemTable where new writes go
+- **imm_memtables**: Immutable MemTables being flushed to object storage
+- **l0**: Level-0 SSTs containing unflushed/recently flushed data
+- **compacted**: Sorted runs containing compacted data organized in levels
+
+### 2. Write Path
+
+The write path involves multiple stages to balance latency and durability:
+
+<Info>
+**Asynchronous Durability**: The `put()` API returns a `Future` that resolves when data is durably persisted to object storage. Clients can use `put_with_options` with `await_durable` set to `false` for lower latency at the cost of durability guarantees.
+</Info>
+
+**Write Flow:**
+
+1. **Write to MemTable** - `put()` operations insert key-value pairs into the active `KVTable` (a skip list-based structure)
+2. **WAL Batching** - Rather than writing every `put()` to object storage, writes are batched based on `flush_interval` or size thresholds
+3. **MemTable Freezing** - When the MemTable reaches the configured size (`l0_sst_size_bytes`), it's frozen and converted to an immutable MemTable
+4. **L0 Flush** - Immutable MemTables are serialized as SSTs and written to the L0 level in object storage
+5. **Manifest Update** - The manifest is updated via compare-and-swap (CAS) to include the new SSTs
+
+**Source:** `slatedb/src/mem_table_flush.rs`, `slatedb/src/db.rs:1-100`
+
+### 3. Read Path
+
+Reads search through multiple levels to find the most recent value:
+
+```
+1. Search memtable (in-memory, O(log n))
+2. Search immutable memtables (in order, newest first)
+3. Search L0 SSTs (in order, newest first)
+4. Search compacted sorted runs (in order, newest first)
+```
+
+To mitigate read latency and API costs, SlateDB employs several optimization techniques:
+
+- **Block Cache**: In-memory cache for SST data blocks
+- **Disk Cache**: Local SST disk cache for frequently accessed data
+- **Bloom Filters**: Probabilistic data structures to avoid unnecessary SST reads
+- **Compression**: Reduces data transfer from object storage
+
+**Source:** `slatedb/src/db_read.rs`, `slatedb/src/reader.rs`
+
+### 4. Table Store
+
+The `TableStore` manages all interactions with object storage:
+
+```rust
+pub(crate) struct TableStore {
+    object_stores: ObjectStores,
+    sst_format: SsTableFormat,
+    path_resolver: PathResolver,
+    cache: Option<Arc<dyn DbCache>>,
+}
+```
+
+**Source:** `slatedb/src/tablestore.rs:31-39`
+
+The TableStore provides:
+- SST reading and writing operations
+- Cache integration (block cache and disk cache)
+- Path resolution for different object store types
+- Support for separate WAL and main object stores
+
+### 5. Compactor
+
+The compactor runs as a background process (or separate process) to:
+
+- Merge L0 SSTs into the first compacted level
+- Merge sorted runs across levels to reduce read amplification
+- Apply compaction filters and merge operators
+- Maintain system invariants (size ratios, run counts)
+
+**Source:** `slatedb/src/compactor.rs:1-56`
+
+<Note>
+The compactor and writer can run in the same process (default) or as separate processes for distributed deployments.
+</Note>
+
+### 6. Manifest
+
+The manifest stores the database's metadata and is persisted to object storage:
+
+```rust
+pub(crate) struct Manifest {
+    pub(crate) core: ManifestCore,
+    pub(crate) writer_epoch: u64,
+    pub(crate) compactor_epoch: u64,
+    // ...
+}
+
+pub struct ManifestCore {
+    pub(crate) l0: VecDeque<SsTableHandle>,
+    pub(crate) compacted: Vec<SortedRun>,
+    pub(crate) wal_id_last_compacted: u64,
+    pub(crate) wal_id_last_seen: u64,
+    // ...
+}
+```
+
+**Source:** `slatedb/src/manifest/mod.rs:20-28`, RFC 0001
+
+The manifest enables:
+- Database state recovery after restarts
+- Fencing of zombie writers/compactors using epochs
+- Snapshot management for consistent reads
+- Garbage collection coordination
+
+## Data Flow
+
+### Write Flow Diagram
+
+```
+Client Write
+     |
+     v
+[MemTable] ----frozen----> [Immutable MemTable]
+                                   |
+                                   v
+                           [Flush to Object Store]
+                                   |
+                                   v
+                            [L0 SST (WAL)]
+                                   |
+                                   v
+                           [Update Manifest]
+                                   |
+                                   v
+                          [Acknowledge Write]
+```
+
+### Compaction Flow
+
+```
+[L0 SSTs] --------+
+                  |
+                  v
+          [Size-Tiered Compaction]
+                  |
+                  v
+         [Merge & Sort Records]
+                  |
+                  v
+        [Write to Sorted Runs]
+                  |
+                  v
+         [Update Manifest via CAS]
+                  |
+                  v
+          [Garbage Collect Old SSTs]
+```
+
+**Source:** RFC 0002 (Compaction)
+
+## Object Storage Layout
+
+SlateDB organizes data in object storage with the following structure:
+
+```
+some-bucket/
+├─ manifest/
+│  ├─ 00000000000000000000.manifest
+│  ├─ 00000000000000000001.manifest
+│  ├─ 00000000000000000002.manifest
+├─ wal/
+│  ├─ 00000000000000000000.sst
+│  ├─ 00000000000000000001.sst
+│  ├─ ...
+├─ compacted/
+│  ├─ 01ARZ3NDEKTSV4RRFFQ69G5FAV.sst
+│  ├─ 01BX5ZZKBKACTAV9WEVGEMMVRZ.sst
+│  ├─ ...
+```
+
+**Source:** RFC 0001 (Manifest Design)
+
+- **manifest/**: Contains numbered manifest files (monotonically increasing)
+- **wal/**: Contains sequentially numbered WAL SSTs
+- **compacted/**: Contains ULID-named compacted SSTs
+
+## Concurrency Model
+
+### Single Writer, Multiple Readers
+
+SlateDB follows a single-writer, multiple-reader model:
+
+<Tip>
+**Writer Fencing**: SlateDB uses writer epochs stored in the manifest to fence zombie writers. When a new writer starts, it atomically increments the writer epoch using CAS, then writes a fencing SST to the WAL. This ensures only one writer can make progress.
+</Tip>
+
+- **Writer**: One active writer per database (fenced by `writer_epoch`)
+- **Compactor**: One active compactor per database (fenced by `compactor_epoch`)  
+- **Readers**: Multiple concurrent readers (snapshot-based isolation)
+
+### Snapshot Isolation
+
+Readers use snapshots for consistent point-in-time views:
+
+```rust
+pub struct Snapshot {
+    pub(crate) id: Uuid,
+    pub(crate) manifest_id: u64,
+    pub(crate) snapshot_expire_time_s: u32,
+}
+```
+
+Snapshots prevent garbage collection of SSTs that readers are still using.
+
+**Source:** RFC 0001 (Manifest Design), `slatedb/src/db_snapshot.rs`
+
+## Durability Guarantees
+
+SlateDB provides strong durability guarantees:
+
+1. **Acknowledged writes are durable** - Once `put().await` completes, data is persisted to object storage
+2. **Manifest updates are atomic** - All manifest updates use CAS to ensure atomicity
+3. **WAL provides crash recovery** - After a crash, the database replays unflushed WAL SSTs
+4. **Object storage durability** - Inherits the durability of the underlying object store (typically 11 9's for S3)
+
+## Performance Characteristics
+
+### Write Performance
+
+- **Latency**: Dominated by object storage PUT latency (typically 10-100ms for S3, 1-10ms for S3 Express)
+- **Throughput**: Limited by `flush_interval` and network bandwidth
+- **Batching**: Writes are batched to amortize object storage API costs
+
+### Read Performance
+
+- **Point Reads**: O(log n) in MemTable, bloom filter checks for SSTs
+- **Range Scans**: Must merge data from all levels
+- **Cache Hit Ratio**: Critical for cost and latency (block cache, disk cache)
+
+### Space Amplification
+
+- **LSM Trade-off**: Multiple versions of keys exist across levels
+- **Compaction**: Reduces space amplification over time
+- **Object Storage**: Cheap storage mitigates space concerns (~$0.023/GB for S3)
+
+**Source:** RFC 0002 (Compaction - Amplification)
+
+## Configuration
+
+Key configuration options that affect architecture:
+
+- `flush_interval`: How often to flush MemTable to object storage
+- `l0_sst_size_bytes`: Target size for L0 SSTs
+- `l0_max_ssts`: Maximum L0 SSTs before back-pressure
+- `compaction_scheduler`: Compaction strategy (currently size-tiered)
+- `block_size`: SST block size (affects caching granularity)
+- `min_filter_keys`: Minimum keys before creating bloom filters
+
+**Source:** `slatedb/src/config.rs`
+
+## Next Steps
+
+- Learn about [LSM-Tree fundamentals](/concepts/lsm-tree)
+- Understand [Object Storage design](/concepts/object-storage)
+- Explore [WAL durability](/concepts/wal)
+- Deep dive into [Compaction strategies](/concepts/compaction)

@@ -1,0 +1,566 @@
+---
+title: 'DbTransaction'
+description: 'API reference for the DbTransaction struct'
+---
+
+# DbTransaction
+
+A database transaction that provides atomic read-write operations with configurable isolation levels. This is the main interface for transactional operations in SlateDB.
+
+## Overview
+
+`DbTransaction` enables atomic operations on the database with support for both Snapshot Isolation (SI) and Serializable Snapshot Isolation (SSI). Transactions provide:
+
+- **ACID guarantees**: Atomic, consistent, isolated, and durable operations
+- **MVCC semantics**: Multi-version concurrency control for consistent reads
+- **Conflict detection**: Automatic detection of read-write and write-write conflicts
+- **Buffered writes**: All writes are buffered until commit
+
+## Creating Transactions
+
+Transactions are created using the `begin()` method on a `Db` instance:
+
+```rust
+use slatedb::{Db, IsolationLevel};
+
+let db = Db::open("path/to/db", object_store).await?;
+
+// Create a transaction with Snapshot Isolation
+let txn = db.begin(IsolationLevel::Snapshot).await?;
+
+// Create a transaction with Serializable Snapshot Isolation
+let txn = db.begin(IsolationLevel::SerializableSnapshot).await?;
+```
+
+## Read Operations
+
+### get()
+
+Retrieve a value for a given key.
+
+<ParamField path="key" type="K: AsRef<[u8]> + Send" required>
+  The key to retrieve
+</ParamField>
+
+**Returns**: `Result<Option<Bytes>, Error>`
+
+**Behavior**:
+- Returns `Some(value)` if the key exists
+- Returns `None` if the key does not exist
+- In SSI mode, automatically tracks the read for conflict detection
+- Sees uncommitted writes from the current transaction
+
+```rust
+let txn = db.begin(IsolationLevel::Snapshot).await?;
+let value = txn.get(b"key").await?;
+
+if let Some(v) = value {
+    println!("Value: {:?}", v);
+}
+```
+
+### get_with_options()
+
+Retrieve a value with custom read options.
+
+<ParamField path="key" type="K: AsRef<[u8]> + Send" required>
+  The key to retrieve
+</ParamField>
+
+<ParamField path="options" type="&ReadOptions" required>
+  Read options to customize the operation
+</ParamField>
+
+**Returns**: `Result<Option<Bytes>, Error>`
+
+```rust
+use slatedb::config::ReadOptions;
+
+let options = ReadOptions::default();
+let value = txn.get_with_options(b"key", &options).await?;
+```
+
+### get_key_value()
+
+Retrieve both key and value as a `KeyValue` pair.
+
+<ParamField path="key" type="K: AsRef<[u8]> + Send" required>
+  The key to retrieve
+</ParamField>
+
+**Returns**: `Result<Option<KeyValue>, Error>`
+
+```rust
+let txn = db.begin(IsolationLevel::Snapshot).await?;
+
+if let Some(kv) = txn.get_key_value(b"key").await? {
+    println!("Key: {:?}, Value: {:?}", kv.key, kv.value);
+}
+```
+
+### get_key_value_with_options()
+
+Retrieve a key-value pair with custom read options.
+
+<ParamField path="key" type="K: AsRef<[u8]> + Send" required>
+  The key to retrieve
+</ParamField>
+
+<ParamField path="options" type="&ReadOptions" required>
+  Read options to customize the operation
+</ParamField>
+
+**Returns**: `Result<Option<KeyValue>, Error>`
+
+## Scan Operations
+
+### scan()
+
+Scan a range of keys and return an iterator.
+
+<ParamField path="range" type="T: RangeBounds<K>" required>
+  The range of keys to scan (supports standard Rust range syntax)
+</ParamField>
+
+**Returns**: `Result<DbIterator, Error>`
+
+**Behavior**:
+- In SSI mode, tracks the scanned range for phantom read detection
+- Includes uncommitted writes from the current transaction
+- Maintains snapshot isolation semantics
+
+```rust
+let txn = db.begin(IsolationLevel::Snapshot).await?;
+
+// Scan a range of keys
+let mut iter = txn.scan(b"key1"..=b"key9").await?;
+while let Some(kv) = iter.next().await? {
+    println!("Key: {:?}, Value: {:?}", kv.key, kv.value);
+}
+```
+
+### scan_with_options()
+
+Scan a range with custom scan options.
+
+<ParamField path="range" type="T: RangeBounds<K>" required>
+  The range of keys to scan
+</ParamField>
+
+<ParamField path="options" type="&ScanOptions" required>
+  Scan options to customize the operation
+</ParamField>
+
+**Returns**: `Result<DbIterator, Error>`
+
+```rust
+use slatedb::config::ScanOptions;
+
+let options = ScanOptions::default();
+let mut iter = txn.scan_with_options(b"key1"..b"key9", &options).await?;
+```
+
+### scan_prefix()
+
+Scan all keys that share a common prefix.
+
+<ParamField path="prefix" type="P: AsRef<[u8]> + Send" required>
+  The key prefix to scan
+</ParamField>
+
+**Returns**: `Result<DbIterator, Error>`
+
+```rust
+let txn = db.begin(IsolationLevel::Snapshot).await?;
+
+// Scan all keys starting with "user:"
+let mut iter = txn.scan_prefix(b"user:").await?;
+while let Some(kv) = iter.next().await? {
+    println!("User key: {:?}", kv.key);
+}
+```
+
+### scan_prefix_with_options()
+
+Scan keys with a prefix using custom options.
+
+<ParamField path="prefix" type="P: AsRef<[u8]> + Send" required>
+  The key prefix to scan
+</ParamField>
+
+<ParamField path="options" type="&ScanOptions" required>
+  Scan options to customize the operation
+</ParamField>
+
+**Returns**: `Result<DbIterator, Error>`
+
+## Write Operations
+
+### put()
+
+Write a key-value pair to the transaction.
+
+<ParamField path="key" type="K: AsRef<[u8]>" required>
+  The key to write
+</ParamField>
+
+<ParamField path="value" type="V: AsRef<[u8]>" required>
+  The value to write
+</ParamField>
+
+**Returns**: `Result<(), Error>`
+
+**Behavior**:
+- Writes are buffered in the transaction's write batch
+- Changes are immediately visible to subsequent reads in the same transaction
+- Changes are not persisted until `commit()` is called
+- Tracked for write-write conflict detection
+
+```rust
+let txn = db.begin(IsolationLevel::Snapshot).await?;
+
+// Write a key-value pair
+txn.put(b"key", b"value")?;
+
+// Read it back within the same transaction
+let value = txn.get(b"key").await?;
+assert_eq!(value, Some(Bytes::from("value")));
+
+// Commit to persist
+txn.commit().await?;
+```
+
+### put_with_options()
+
+Write a key-value pair with custom put options.
+
+<ParamField path="key" type="K: AsRef<[u8]>" required>
+  The key to write
+</ParamField>
+
+<ParamField path="value" type="V: AsRef<[u8]>" required>
+  The value to write
+</ParamField>
+
+<ParamField path="options" type="&PutOptions" required>
+  Put options to customize the operation
+</ParamField>
+
+**Returns**: `Result<(), Error>`
+
+### delete()
+
+Delete a key from the transaction.
+
+<ParamField path="key" type="K: AsRef<[u8]>" required>
+  The key to delete
+</ParamField>
+
+**Returns**: `Result<(), Error>`
+
+```rust
+let txn = db.begin(IsolationLevel::Snapshot).await?;
+
+txn.delete(b"key")?;
+
+// Verify deletion within transaction
+assert_eq!(txn.get(b"key").await?, None);
+
+txn.commit().await?;
+```
+
+### merge()
+
+Merge a value with an existing key using the configured merge operator.
+
+<ParamField path="key" type="K: AsRef<[u8]>" required>
+  The key to merge
+</ParamField>
+
+<ParamField path="value" type="V: AsRef<[u8]>" required>
+  The value to merge
+</ParamField>
+
+**Returns**: `Result<(), Error>`
+
+```rust
+let txn = db.begin(IsolationLevel::Snapshot).await?;
+
+// Assuming a counter merge operator is configured
+txn.merge(b"counter", &1u64.to_le_bytes())?;
+txn.merge(b"counter", &2u64.to_le_bytes())?;
+
+txn.commit().await?;
+```
+
+### merge_with_options()
+
+Merge a value with custom merge options.
+
+<ParamField path="key" type="K: AsRef<[u8]>" required>
+  The key to merge
+</ParamField>
+
+<ParamField path="value" type="V: AsRef<[u8]>" required>
+  The value to merge
+</ParamField>
+
+<ParamField path="options" type="&MergeOptions" required>
+  Merge options to customize the operation
+</ParamField>
+
+**Returns**: `Result<(), Error>`
+
+## Conflict Detection
+
+### mark_read()
+
+Explicitly mark keys as read for conflict detection.
+
+<ParamField path="keys" type="I: IntoIterator<Item = K>" required>
+  An iterator of keys to mark as read
+</ParamField>
+
+**Returns**: `Result<(), Error>`
+
+**Behavior**:
+- Tracks read operations for conflict detection
+- Works with both SI and SSI isolation levels
+- In SI mode, enables selective read-write conflict detection
+- In SSI mode, provides additional conflict tracking beyond automatic tracking
+
+```rust
+let txn = db.begin(IsolationLevel::Snapshot).await?;
+
+// Explicitly mark keys as read
+txn.mark_read([b"key1", b"key2", b"key3"])?;
+
+// Later write operations
+txn.put(b"key4", b"value")?;
+
+// Will detect conflicts if another transaction modified key1, key2, or key3
+txn.commit().await?;
+```
+
+### unmark_write()
+
+Exclude keys from write conflict detection.
+
+<ParamField path="keys" type="I: IntoIterator<Item = K>" required>
+  An iterator of keys to exclude from conflict tracking
+</ParamField>
+
+**Returns**: `Result<(), Error>`
+
+**Behavior**:
+- Keys are still written atomically with the transaction
+- Excluded from both read-write and write-write conflict detection
+- Can be called before or after writing the key
+- Once unmarked, remains unmarked for the transaction duration
+
+**Use Case**: Useful for commutative operations like counters where conflicts are acceptable.
+
+```rust
+let txn = db.begin(IsolationLevel::Snapshot).await?;
+
+// Write a counter that should not cause conflicts
+txn.put(b"counter", b"1")?;
+txn.unmark_write([b"counter"])?;
+
+// Even if another transaction modifies "counter", this won't conflict
+txn.commit().await?;
+```
+
+## Transaction Control
+
+### commit()
+
+Commit the transaction, persisting all buffered writes.
+
+**Returns**: `Result<Option<WriteHandle>, Error>`
+
+**Behavior**:
+- Applies all buffered operations atomically
+- Performs conflict detection based on isolation level
+- Returns `Ok(Some(WriteHandle))` if writes were committed
+- Returns `Ok(None)` if the write batch was empty (read-only transaction)
+- Returns `Err(Error::TransactionConflict)` if conflicts are detected
+
+```rust
+let txn = db.begin(IsolationLevel::Snapshot).await?;
+
+txn.put(b"key1", b"value1")?;
+txn.put(b"key2", b"value2")?;
+
+match txn.commit().await {
+    Ok(Some(handle)) => {
+        // Wait for durability if needed
+        handle.await_durable().await?;
+        println!("Transaction committed");
+    }
+    Ok(None) => println!("No changes to commit"),
+    Err(e) => println!("Commit failed: {}", e),
+}
+```
+
+### commit_with_options()
+
+Commit the transaction with custom write options.
+
+<ParamField path="options" type="&WriteOptions" required>
+  Write options to customize the commit behavior
+</ParamField>
+
+**Returns**: `Result<Option<WriteHandle>, Error>`
+
+```rust
+use slatedb::config::WriteOptions;
+
+let txn = db.begin(IsolationLevel::Snapshot).await?;
+txn.put(b"key", b"value")?;
+
+// Commit without waiting for durability
+let options = WriteOptions {
+    await_durable: false,
+};
+txn.commit_with_options(&options).await?;
+```
+
+### rollback()
+
+Rollback the transaction, discarding all buffered writes.
+
+**Returns**: `()` (consumes the transaction)
+
+**Behavior**:
+- Discards all uncommitted operations
+- Automatically called when the transaction is dropped
+- No-op if already committed
+
+```rust
+let txn = db.begin(IsolationLevel::Snapshot).await?;
+
+txn.put(b"key", b"value")?;
+
+// Explicitly rollback
+txn.rollback();
+
+// Or just drop the transaction
+drop(txn);
+```
+
+## Inspection Methods
+
+### seqnum()
+
+Get the sequence number when the transaction started.
+
+**Returns**: `u64`
+
+This represents the snapshot sequence number for the transaction, which determines data visibility for reads.
+
+```rust
+let txn = db.begin(IsolationLevel::Snapshot).await?;
+let seq = txn.seqnum();
+println!("Transaction snapshot: {}", seq);
+```
+
+### id()
+
+Get the unique transaction ID.
+
+**Returns**: `Uuid`
+
+```rust
+let txn = db.begin(IsolationLevel::Snapshot).await?;
+let id = txn.id();
+println!("Transaction ID: {}", id);
+```
+
+## Transaction Patterns
+
+### Basic Read-Modify-Write
+
+```rust
+let txn = db.begin(IsolationLevel::Snapshot).await?;
+
+// Read current value
+if let Some(value) = txn.get(b"counter").await? {
+    let count = u64::from_le_bytes(value.as_ref().try_into()?);
+    
+    // Increment
+    let new_count = count + 1;
+    txn.put(b"counter", &new_count.to_le_bytes())?;
+    
+    // Commit
+    txn.commit().await?;
+}
+```
+
+### Batch Operations
+
+```rust
+let txn = db.begin(IsolationLevel::Snapshot).await?;
+
+// Write multiple keys
+for i in 0..100 {
+    let key = format!("key_{}", i);
+    let value = format!("value_{}", i);
+    txn.put(key.as_bytes(), value.as_bytes())?;
+}
+
+// Single atomic commit
+txn.commit().await?;
+```
+
+### Conflict Handling with Retry
+
+```rust
+use slatedb::Error;
+
+let max_retries = 3;
+for attempt in 0..max_retries {
+    let txn = db.begin(IsolationLevel::SerializableSnapshot).await?;
+    
+    // Perform operations
+    let value = txn.get(b"key").await?;
+    txn.put(b"key", b"new_value")?;
+    
+    match txn.commit().await {
+        Ok(_) => {
+            println!("Transaction succeeded");
+            break;
+        }
+        Err(Error::SlateDB(slatedb::error::SlateDBError::TransactionConflict)) => {
+            if attempt == max_retries - 1 {
+                return Err(Error::SlateDB(slatedb::error::SlateDBError::TransactionConflict));
+            }
+            println!("Conflict detected, retrying...");
+        }
+        Err(e) => return Err(e),
+    }
+}
+```
+
+### Optimistic Concurrent Counter
+
+```rust
+// Using unmark_write for high-concurrency counters
+let txn = db.begin(IsolationLevel::Snapshot).await?;
+
+let current = txn.get(b"page_views").await?
+    .map(|v| u64::from_le_bytes(v.as_ref().try_into().unwrap()))
+    .unwrap_or(0);
+
+txn.put(b"page_views", &(current + 1).to_le_bytes())?;
+txn.unmark_write([b"page_views"])?;
+
+// No conflicts on this key
+txn.commit().await?;
+```
+
+## See Also
+
+- [IsolationLevel](/api/isolation-level) - Transaction isolation levels
+- [Db](/api/db) - Database instance API
+- [WriteBatch](/api/write-batch) - Batch write operations

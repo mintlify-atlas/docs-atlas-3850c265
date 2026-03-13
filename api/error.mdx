@@ -1,0 +1,445 @@
+---
+title: Error Handling
+description: Error types and handling patterns in SlateDB
+---
+
+## Overview
+
+SlateDB provides a comprehensive error handling system with two primary types:
+- `Error` - Public-facing error type with categorized error kinds
+- `SlateDBError` - Internal error type with detailed error variants
+
+## Error
+
+The public-facing error type that applications interact with.
+
+```rust
+pub struct Error {
+    msg: String,
+    kind: ErrorKind,
+    source: Option<BoxError>,
+}
+```
+
+### Methods
+
+#### `Error::transaction(msg: String) -> Self`
+
+Creates a new transaction error.
+
+**Example:**
+```rust
+let err = Error::transaction("Transaction conflict detected".to_string());
+```
+
+#### `Error::closed(msg: String, reason: CloseReason) -> Self`
+
+Creates a new closed error with the specified close reason.
+
+**Example:**
+```rust
+let err = Error::closed("Database closed".to_string(), CloseReason::Clean);
+```
+
+#### `Error::unavailable(msg: String) -> Self`
+
+Creates a new unavailable error for storage or network issues.
+
+**Example:**
+```rust
+let err = Error::unavailable("Object storage unavailable".to_string());
+```
+
+#### `Error::invalid(msg: String) -> Self`
+
+Creates a new invalid error for configuration or argument issues.
+
+**Example:**
+```rust
+let err = Error::invalid("Invalid cache size".to_string());
+```
+
+#### `Error::data(msg: String) -> Self`
+
+Creates a new data error for corrupted or incompatible data.
+
+**Example:**
+```rust
+let err = Error::data("Checksum mismatch".to_string());
+```
+
+#### `Error::internal(msg: String) -> Self`
+
+Creates a new internal error. Users should not expect to see this.
+
+**Example:**
+```rust
+let err = Error::internal("Unexpected internal state".to_string());
+```
+
+#### `Error::with_source(self, source: BoxError) -> Self`
+
+Adds a source error for error chaining.
+
+**Example:**
+```rust
+let err = Error::unavailable("IO failed".to_string())
+    .with_source(Box::new(io_error));
+```
+
+#### `Error::kind(&self) -> ErrorKind`
+
+Returns the error kind.
+
+**Example:**
+```rust
+if err.kind() == ErrorKind::Transaction {
+    // Retry transaction
+}
+```
+
+## ErrorKind
+
+Represents the category of errors that can be returned to users.
+
+```rust
+pub enum ErrorKind {
+    Transaction,
+    Closed(CloseReason),
+    Unavailable,
+    Invalid,
+    Data,
+    Internal,
+}
+```
+
+### Variants
+
+#### `Transaction`
+
+A transaction conflict occurred. The transaction must be retried or dropped.
+
+**Handling:**
+```rust
+match result {
+    Err(e) if e.kind() == ErrorKind::Transaction => {
+        // Retry transaction logic
+    }
+    _ => {}
+}
+```
+
+#### `Closed(CloseReason)`
+
+The database has been shutdown. The instance is no longer usable.
+
+**Handling:**
+```rust
+match result {
+    Err(e) if matches!(e.kind(), ErrorKind::Closed(_)) => {
+        // Create new database instance
+    }
+    _ => {}
+}
+```
+
+#### `Unavailable`
+
+A storage or network service is unavailable. The user must retry or drop the operation.
+
+**Handling:**
+```rust
+match result {
+    Err(e) if e.kind() == ErrorKind::Unavailable => {
+        // Implement retry with backoff
+    }
+    _ => {}
+}
+```
+
+#### `Invalid`
+
+User attempted an invalid request due to:
+- Invalid configuration on initialization
+- Invalid argument to a method
+- Invalid method call
+- User-supplied plugin failure
+
+**Handling:**
+```rust
+match result {
+    Err(e) if e.kind() == ErrorKind::Invalid => {
+        // Fix configuration or arguments
+    }
+    _ => {}
+}
+```
+
+#### `Data`
+
+Persisted data is in an unexpected state, caused by:
+- Machine or storage corruption
+- Incompatible file format versions
+- Eventual consistency issues
+
+**Handling:**
+```rust
+match result {
+    Err(e) if e.kind() == ErrorKind::Data => {
+        // Check data integrity or client version
+    }
+    _ => {}
+}
+```
+
+#### `Internal`
+
+An unexpected internal error occurred. Please [open a GitHub issue](https://github.com/slatedb/slatedb/issues/new?template=bug_report.md&title=Internal+error+returned) if you receive this error.
+
+## CloseReason
+
+Represents why a database instance has been closed.
+
+```rust
+pub enum CloseReason {
+    Clean,
+    Fenced,
+    Panic,
+}
+```
+
+### Variants
+
+#### `Clean`
+
+The database has been shutdown cleanly.
+
+#### `Fenced`
+
+The current instance has been fenced and is no longer usable.
+
+#### `Panic`
+
+One or more background tasks panicked.
+
+## SlateDBError
+
+Internal error type used within SlateDB. This type is converted to the public `Error` type when returned to users.
+
+<Note>
+This is an internal type. Most applications should work with the public `Error` type instead.
+</Note>
+
+### Error Variants
+
+#### I/O and Storage Errors
+
+- `IoError(Arc<std::io::Error>)` - I/O error
+- `ObjectStoreError(Arc<object_store::Error>)` - Object store error
+- `ChecksumMismatch` - Checksum validation failed
+
+#### SSTable Errors
+
+- `EmptySSTable` - SSTable is empty
+- `EmptyBlock` - Block is empty
+- `EmptyBlockMeta` - Block metadata is empty
+- `EmptyKey` - Row entry has empty key
+- `InvalidFlatbuffer(flatbuffers::InvalidFlatbuffer)` - Invalid SSTable format
+
+#### Manifest Errors
+
+- `EmptyManifest` - Manifest is empty
+- `ManifestMissing(u64)` - Failed to find manifest with specified ID
+- `InvalidManifestPollInterval(Duration)` - Invalid manifest poll interval
+
+#### Transactional Object Errors
+
+- `TransactionalObjectVersionExists` - Version already exists
+- `LatestTransactionalObjectVersionMissing` - Failed to find latest version
+- `TransactionalObjectError(Arc<TransactionalObjectError>)` - Generic transactional object error
+- `TransactionalObjectTimeout { timeout: Duration }` - Operation timeout
+- `InvalidTransactionalObjectState` - Invalid state detected
+
+#### Database State Errors
+
+- `InvalidDBState` - Database is in an invalid state
+- `Closed` - Database has been closed
+- `Fenced` - Database instance has been fenced by a newer client
+- `InvalidDeletion` - Invalid deletion attempt
+- `EmptyBatch` - Empty write batch not allowed
+
+#### Compaction Errors
+
+- `InvalidCompaction` - Invalid compaction
+- `CompactionExecutorFailed` - Compaction executor failed
+- `CompactionFilterError(Arc<CompactionFilterError>)` - Compaction filter error (requires `compaction_filters` feature)
+
+#### Compression Errors
+
+- `InvalidCompressionCodec` - Invalid compression codec
+- `BlockDecompressionError` - Error decompressing block (requires compression features)
+- `BlockCompressionError` - Error compressing block (requires compression features)
+- `BlockTransformError` - Error transforming block
+
+#### Cache Errors
+
+- `InvalidCachePartSize` - Cache part size must be multiple of 1024 and greater than 0
+- `FoyerError(Arc<foyer::Error>)` - Foyer cache error (requires `foyer` feature)
+
+#### Clock and Sequence Errors
+
+- `InvalidClockTick { last_tick: i64, next_tick: i64 }` - Clock ticks must be monotonic
+- `InvalidSequenceOrder { current_seq: u64, next_seq: u64 }` - Invalid sequence number ordering during merge
+
+#### Configuration Errors
+
+- `WalStoreReconfigurationError` - WAL store reconfiguration unsupported
+- `WalDisabled` - Attempted WAL operation when WAL is disabled
+- `UnknownConfigurationFormat(PathBuf)` - Unknown configuration file format
+- `InvalidConfigurationFormat(Box<figment::Error>)` - Invalid configuration format
+- `InvalidObjectStoreURL(String, url::ParseError)` - Invalid object store URL
+- `UndefinedEnvironmentVariable { key: String }` - Undefined environment variable
+- `InvalidEnvironmentVariable { key: String, value: String }` - Invalid environment variable value
+
+#### Iterator Errors
+
+- `SeekKeyOutOfRange { key: Vec<u8>, range: BytesRange }` - Seek key outside iterator range
+- `SeekKeyLessThanLastReturnedKey` - Cannot seek to key less than last returned key
+- `SeekKeyOutOfKeyRange { key: Vec<u8>, start_key: Bound<Vec<u8>>, end_key: Bound<Vec<u8>> }` - Seek key outside key range
+- `IteratorNotInitialized` - Iterator not initialized
+
+#### Checkpoint Errors
+
+- `CheckpointMissing(Uuid)` - Checkpoint not found
+- `InvalidCheckpointLifetime(Duration)` - Invalid checkpoint lifetime
+- `CheckpointLifetimeTooShort { lifetime: Duration, interval: Duration }` - Checkpoint lifetime must be at least double the manifest poll interval
+
+#### Clone Errors
+
+- `IdenticalClonePaths(Path)` - Parent and clone paths must be different
+- `CloneExternalDbMissing` - Cloned database not attached to external database
+- `CloneIncorrectExternalDbCheckpoint { path: String, checkpoint_id: Option<Uuid> }` - Clone not attached to valid checkpoint
+- `CloneIncorrectFinalCheckpoint { path: String, checkpoint_id: Uuid }` - Final checkpoint no longer exists in manifest
+
+#### Merge Operator Errors
+
+- `MergeOperatorError(MergeOperatorError)` - Merge operator error
+- `MergeOperatorMissing` - Merge operator required to read merge operands
+
+#### Background Task Errors
+
+- `BackgroundTaskPanic(String)` - Background task panicked
+- `BackgroundTaskExists(String)` - Background task already exists
+- `BackgroundTaskCancelled(String)` - Background task cancelled
+- `BackgroundTaskExecutorStarted` - Background task executor already started
+- `ReadChannelError(tokio::sync::oneshot::error::RecvError)` - Read channel error
+
+#### Version and Format Errors
+
+- `InvalidVersion { format_name: &'static str, supported_versions: Vec<u16>, actual_version: u16 }` - Unsupported format version
+- `InvalidRowFlags { encoded_bits: u8, known_bits: u8, message: String }` - Invalid row flags
+
+#### Transaction Errors
+
+- `TransactionConflict` - Transaction conflict occurred
+
+#### Miscellaneous Errors
+
+- `InvalidSSTBatchSize(usize)` - Invalid SST batch size
+- `UnexpectedTombstone` - Unexpected tombstone encountered where value was expected
+
+## Error Handling Patterns
+
+### Basic Error Handling
+
+```rust
+use slatedb::{Db, Error, ErrorKind};
+
+let result = db.get(b"key").await;
+match result {
+    Ok(value) => {
+        // Handle success
+    }
+    Err(e) => {
+        eprintln!("Error: {}", e);
+        match e.kind() {
+            ErrorKind::Transaction => {
+                // Retry transaction
+            }
+            ErrorKind::Unavailable => {
+                // Retry with backoff
+            }
+            ErrorKind::Invalid => {
+                // Fix input or configuration
+            }
+            _ => {
+                // Handle other errors
+            }
+        }
+    }
+}
+```
+
+### Retry Pattern for Transactions
+
+```rust
+use slatedb::{Db, Error, ErrorKind};
+
+const MAX_RETRIES: u32 = 3;
+
+for attempt in 0..MAX_RETRIES {
+    match db.put(b"key", b"value").await {
+        Ok(_) => break,
+        Err(e) if e.kind() == ErrorKind::Transaction => {
+            if attempt == MAX_RETRIES - 1 {
+                return Err(e);
+            }
+            // Retry
+            continue;
+        }
+        Err(e) => return Err(e),
+    }
+}
+```
+
+### Handling Closed Database
+
+```rust
+use slatedb::{Db, Error, ErrorKind, CloseReason};
+
+match db.get(b"key").await {
+    Err(e) => match e.kind() {
+        ErrorKind::Closed(CloseReason::Fenced) => {
+            // Another instance took over, create new instance
+        }
+        ErrorKind::Closed(CloseReason::Panic) => {
+            // Background task panicked, check logs
+        }
+        ErrorKind::Closed(CloseReason::Clean) => {
+            // Database was shutdown normally
+        }
+        _ => {}
+    },
+    Ok(value) => {
+        // Handle success
+    }
+}
+```
+
+### Error Source Inspection
+
+```rust
+use slatedb::{Db, Error};
+
+match db.get(b"key").await {
+    Err(e) => {
+        eprintln!("Error: {}", e);
+        if let Some(source) = e.source() {
+            eprintln!("Caused by: {}", source);
+        }
+    }
+    Ok(value) => {
+        // Handle success
+    }
+}
+```

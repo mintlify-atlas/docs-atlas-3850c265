@@ -1,0 +1,452 @@
+---
+title: Object Storage
+description: Why SlateDB uses object storage, trade-offs, write batching, and cost optimization
+---
+
+## Why Object Storage?
+
+SlateDB is designed from the ground up to use object storage (S3, GCS, Azure Blob Storage, MinIO, Tigris) rather than traditional local or attached disks. This architectural decision provides unique advantages:
+
+### Advantages
+
+**Bottomless Capacity**
+- No need to provision disk space upfront
+- Storage scales automatically with data growth
+- No "disk full" errors
+
+**High Durability**
+- Object stores provide 99.999999999% (11 9's) durability (S3 Standard)
+- Data is automatically replicated across multiple availability zones
+- No need to manage RAID or replication
+
+**Cost Efficiency**
+- Object storage costs ~$0.023/GB for S3 Standard (as of 2024)
+- ~5-20x cheaper than provisioned EBS volumes (~$0.08-0.16/GB)
+- No cost for idle capacity
+
+**Easy Replication**
+- Simple cross-region replication
+- No complex distributed consensus protocols
+- Can share data between multiple compute instances
+
+**Operational Simplicity**
+- No disk management or provisioning
+- Built-in versioning and lifecycle policies
+- Proven operational tools and practices
+
+<Info>
+**SlateDB's Core Insight**: While object storage has higher latency than local disk, the benefits of bottomless capacity, durability, and cost make it ideal for embedded databases, especially when combined with aggressive caching.
+</Info>
+
+## Trade-offs
+
+### Higher Latency
+
+Object storage operations are significantly slower than local disk:
+
+| Operation | Local SSD | EBS | S3 Standard | S3 Express One Zone |
+|-----------|-----------|-----|-------------|--------------------|
+| Read Latency | &lt;0.1ms | 1-3ms | 10-100ms | 1-10ms |
+| Write Latency | &lt;0.1ms | 1-3ms | 10-100ms | 1-10ms |
+| Bandwidth (single stream) | 3-7 GB/s | 250-16,000 MB/s | 100-200 MB/s | 100-200 MB/s |
+
+**Source:** AWS documentation, RFC 0001
+
+**SlateDB Mitigations:**
+
+1. **Write Batching**: Batch multiple writes before flushing to object storage
+2. **Aggressive Caching**: Multi-tier cache (memory, local disk) for reads
+3. **Bloom Filters**: Avoid unnecessary object storage reads
+4. **Optional Low-Latency Storage**: Support for S3 Express One Zone for WAL
+
+### Higher API Costs
+
+Object storage charges per API request:
+
+| Operation | S3 Standard | S3 Express One Zone |
+|-----------|-------------|--------------------|
+| PUT | $0.005 per 1,000 | $0.002 per 1,000 |
+| GET | $0.0004 per 1,000 | $0.0004 per 1,000 |
+| LIST | $0.005 per 1,000 | $0.005 per 1,000 |
+| Data Transfer Out | $0.09 per GB | $0.16 per GB |
+
+**Source:** AWS S3 Pricing (as of 2024)
+
+<Note>
+**Cost Calculation Example**: A database writing 1,000 transactions/second with 1-second flush interval:
+- 86,400 PUTs/day = $0.43/day = $13/month
+- This is negligible compared to compute costs (~$50-100/month for m5.xlarge)
+</Note>
+
+### No Atomic Rename
+
+Object storage lacks atomic operations like POSIX rename. SlateDB handles this through:
+
+1. **Compare-and-Swap (CAS)**: GCS, Azure Blob Storage support conditional writes
+2. **Two-Phase Commit**: S3 uses a transactional store (DynamoDB) to emulate CAS
+3. **Immutable Data**: SSTs are write-once, avoiding update-in-place issues
+
+**Source:** RFC 0001 (Manifest Design)
+
+## Write Batching Strategy
+
+SlateDB batches writes to amortize object storage PUT costs and latency:
+
+### Batching in MemTable
+
+```rust
+pub struct Settings {
+    pub flush_interval: Duration,
+    pub l0_sst_size_bytes: usize,
+    // ...
+}
+```
+
+**Source:** `slatedb/src/config.rs`
+
+**Write batching parameters:**
+
+- **`flush_interval`**: Maximum time to buffer writes in memory (default: 1s)
+  - Shorter interval = lower write latency, higher API costs
+  - Longer interval = higher write latency, lower API costs
+  
+- **`l0_sst_size_bytes`**: Target size for L0 SSTs (default: 4MB)
+  - Larger SSTs = fewer PUTs, more efficient compaction
+  - Smaller SSTs = lower memory usage, faster recovery
+
+### Flush Modes
+
+SlateDB supports two flush modes:
+
+**1. Time-Based Flush**
+```rust
+if elapsed_since_last_flush > flush_interval {
+    freeze_memtable();
+    flush_to_object_storage();
+}
+```
+
+**2. Size-Based Flush**
+```rust
+if memtable.size() >= l0_sst_size_bytes {
+    freeze_memtable();
+    flush_to_object_storage();
+}
+```
+
+**Source:** `slatedb/src/mem_table_flush.rs`
+
+### Durability vs. Latency Trade-off
+
+```rust
+// Default: await durability
+let ack = db.put(b"key", b"value").await?;
+
+// Low-latency: don't await durability  
+let ack = db.put_with_options(
+    b"key", 
+    b"value",
+    PutOptions::default().with_await_durable(false)
+).await?;
+```
+
+**Source:** `slatedb/src/config.rs`, README.md:17-19
+
+<Tip>
+**Recommendation**: Use `await_durable = true` for critical writes (financial transactions, user data) and `await_durable = false` for less critical writes (cache, metrics, logs).
+</Tip>
+
+## Separate WAL Object Store
+
+SlateDB supports using a separate, lower-latency object store for the WAL:
+
+```rust
+pub async fn open_with_opts<P: Into<Path>>(
+    path: P,
+    options: DbOptions,
+    main_object_store: Arc<dyn ObjectStore>,
+    wal_object_store: Option<Arc<dyn ObjectStore>>,
+) -> Result<Self, SlateDBError>
+```
+
+**Source:** `slatedb/src/db/builder.rs`, RFC 0009
+
+**Use cases:**
+
+1. **S3 + S3 Express**: Use S3 Express One Zone for WAL (1-10ms latency) and S3 Standard for compacted data (lower cost)
+2. **Local + Cloud**: Use local disk for WAL and cloud storage for compacted data
+3. **Regional + Cross-Region**: Use regional storage for WAL and multi-region storage for durability
+
+**Layout:**
+```
+wal_object_store/
+├─ wal/
+│  ├─ 00000000000000000000.sst
+│  └─ ...
+
+main_object_store/
+├─ manifest/
+│  └─ ...
+└─ compacted/
+   └─ ...
+```
+
+<Note>
+The WAL only stores unflushed writes, so it remains small. Most data lives in compacted storage, where lower costs matter more than latency.
+</Note>
+
+## Caching Strategy
+
+SlateDB uses multi-tier caching to mitigate object storage latency:
+
+### Block Cache (Memory)
+
+```rust
+pub struct DbCache {
+    block_cache: Arc<dyn Cache<BlockCacheKey, Arc<Block>>>,
+    // ...
+}
+```
+
+**Source:** `slatedb/src/db_cache/mod.rs`
+
+- **Purpose**: Cache frequently accessed SST blocks in memory
+- **Size**: Configurable (default: 128MB)
+- **Eviction**: LRU or adaptive policies
+- **Hit Rate Target**: >90% for read-heavy workloads
+
+### Object Store Cache (Disk)
+
+```rust
+pub struct CachedObjectStore {
+    object_store: Arc<dyn ObjectStore>,
+    disk_cache: Arc<dyn DiskCache>,
+    // ...
+}
+```
+
+**Source:** `slatedb/src/cached_object_store/mod.rs`
+
+- **Purpose**: Cache entire SST files on local disk
+- **Size**: Configurable (typically 10-100GB)
+- **Use Case**: Reduce object storage GETs and data transfer costs
+- **Cost Benefit**: Local disk read costs < $0.01, object storage GET costs $0.0004
+
+### Filter Cache
+
+Bloom filters are cached separately:
+
+```rust
+pub struct CachedEntry {
+    filter: Option<Arc<BloomFilter>>,
+    index: Option<Arc<SsTableIndexOwned>>,
+    // ...
+}
+```
+
+**Source:** `slatedb/src/db_cache/mod.rs`
+
+- **Purpose**: Keep bloom filters in memory to avoid object storage reads
+- **Size**: Small (~10-100 bytes per 1000 keys)
+- **Hit Rate**: Should be ~100% for active SSTs
+
+## Network Bandwidth Considerations
+
+Object storage bandwidth limits affect performance:
+
+**AWS EC2 Network Bandwidth:**
+
+| Instance Type | Network Bandwidth | Disk Bandwidth (NVMe) | EBS Bandwidth |
+|---------------|-------------------|----------------------|---------------|
+| m5d.xlarge | 1280 Mbps (baseline) | ~230 MBps read | ~594 MBps (burst) |
+| m5d.metal | 25 Gbps | ~5468 MBps read | 2375 MBps |
+| i3en.xlarge | ~537 MBps (baseline) | ~332 MBps read | ~594 MBps (burst) |
+| i3en.metal | 100 Gbps | ~7812 MBps read | 2375 MBps |
+
+**Source:** RFC 0002 (Compaction - Appendix)
+
+<Info>
+**Insight**: Network bandwidth to/from S3 is often the bottleneck for compaction-heavy workloads, not disk I/O. This is why SlateDB splits compaction work between writer and compactor processes.
+</Info>
+
+## Object Store Selection
+
+SlateDB supports multiple object store backends:
+
+### AWS S3
+
+**Advantages:**
+- Most mature object storage service
+- Strong consistency (since 2020)
+- S3 Express One Zone for low-latency
+
+**Disadvantages:**
+- No native CAS (requires DynamoDB for fencing)
+- Higher latency than competitors for single-object operations
+
+### Google Cloud Storage (GCS)
+
+**Advantages:**
+- Native CAS via `If-Generation-Match`
+- Slightly lower latency than S3 in some regions
+- Simpler consistency model
+
+**Disadvantages:**
+- Slightly higher costs than S3
+- Fewer regions than S3
+
+### Azure Blob Storage (ABS)
+
+**Advantages:**
+- Native CAS via `If-Match`
+- Competitive pricing
+- Good integration with Azure ecosystem
+
+**Disadvantages:**
+- Latency varies by region
+- Fewer third-party tools than S3
+
+### MinIO / Tigris / R2
+
+**Advantages:**
+- S3-compatible API
+- Self-hosted options (MinIO)
+- Competitive pricing (Tigris, R2)
+
+**Disadvantages:**
+- Varying consistency guarantees
+- Less mature than cloud providers
+
+<Tip>
+**Recommendation**: Use S3 Standard + S3 Express One Zone for production workloads. Use MinIO for development/testing.
+</Tip>
+
+## Replication and Disaster Recovery
+
+Object storage simplifies replication:
+
+### Cross-Region Replication
+
+```
+Primary Region (us-east-1)
+├─ SlateDB Writer
+└─ Object Storage (replicated to us-west-2)
+
+Secondary Region (us-west-2)
+├─ SlateDB Reader (read-only)
+└─ Object Storage (replica)
+```
+
+Advantages:
+- **Simple Setup**: Enable replication in object store settings
+- **No Consensus**: No Paxos/Raft needed
+- **Async Replication**: Doesn't impact write latency
+
+### Backup and Restore
+
+Object storage versioning provides point-in-time recovery:
+
+```bash
+# Enable versioning
+aws s3api put-bucket-versioning \
+  --bucket my-slatedb-bucket \
+  --versioning-configuration Status=Enabled
+
+# Restore to specific version
+aws s3api list-object-versions \
+  --bucket my-slatedb-bucket \
+  --prefix manifest/
+```
+
+**Source:** RFC 0001 (Manifest Design)
+
+## Cost Optimization Best Practices
+
+### 1. Tune Flush Interval
+
+```rust
+// High-throughput, cost-sensitive
+let settings = Settings::default()
+    .with_flush_interval(Duration::from_secs(5))
+    .with_l0_sst_size_bytes(16 * 1024 * 1024);  // 16MB
+
+// Low-latency, cost-tolerant
+let settings = Settings::default()
+    .with_flush_interval(Duration::from_millis(100))
+    .with_l0_sst_size_bytes(1 * 1024 * 1024);  // 1MB
+```
+
+### 2. Right-Size Caches
+
+```rust
+let settings = Settings::default()
+    .with_block_cache_size(512 * 1024 * 1024)  // 512MB memory cache
+    .with_object_store_cache_size(50 * 1024 * 1024 * 1024);  // 50GB disk cache
+```
+
+### 3. Use Lifecycle Policies
+
+Configure object storage to transition old SSTs to cheaper storage tiers:
+
+```json
+{
+  "Rules": [{
+    "Id": "ArchiveOldSSTs",
+    "Filter": {"Prefix": "compacted/"},
+    "Status": "Enabled",
+    "Transitions": [{
+      "Days": 30,
+      "StorageClass": "GLACIER_IR"
+    }]
+  }]
+}
+```
+
+<Note>
+**Warning**: Only apply lifecycle policies to compacted SSTs that are no longer referenced by active manifests. Use SlateDB's garbage collector to identify candidates.
+</Note>
+
+### 4. Enable Compression
+
+```rust
+let settings = Settings::default()
+    .with_compression_codec(CompressionCodec::Zstd);  // or Snappy, Lz4
+```
+
+**Source:** `slatedb/src/config.rs`
+
+Compression reduces:
+- Object storage costs (data at rest)
+- Data transfer costs (GET operations)
+- Network bandwidth usage
+
+Trade-off: Increased CPU usage for compression/decompression
+
+## Performance Benchmarks
+
+Typical SlateDB performance characteristics:
+
+**Write Performance:**
+- **Throughput**: 10K-50K writes/sec (depends on flush_interval)
+- **Latency**: 100-500ms (S3 Standard), 10-50ms (S3 Express)
+- **Bottleneck**: Object storage PUT latency
+
+**Read Performance:**
+- **Point Reads**: 5K-20K reads/sec (90%+ cache hit)
+- **Latency**: &lt;1ms (cache hit), 10-100ms (cache miss)
+- **Bottleneck**: Cache size and hit rate
+
+**Compaction:**
+- **Throughput**: 100-500 MB/s (depends on network)
+- **Bottleneck**: Network bandwidth and compaction strategy
+
+<Info>
+These benchmarks are for reference only. Actual performance depends on workload, instance type, region, cache configuration, and object store selection.
+</Info>
+
+## Next Steps
+
+- Learn about [WAL durability](/concepts/wal) guarantees
+- Understand [Compaction strategies](/concepts/compaction)
+- Explore [LSM-tree fundamentals](/concepts/lsm-tree)
+- Read [Architecture](/concepts/architecture) overview

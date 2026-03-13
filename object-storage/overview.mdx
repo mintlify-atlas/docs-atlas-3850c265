@@ -1,0 +1,103 @@
+---
+title: Object Storage Overview
+description: Learn how to configure SlateDB with different object storage backends
+---
+
+SlateDB is designed to work with cloud object storage as its durable storage layer. This architecture allows you to separate compute from storage, enabling scalable and cost-effective database deployments.
+
+## Supported Object Storage Backends
+
+SlateDB supports multiple object storage backends through the `object_store` crate:
+
+<CardGroup cols={2}>
+  <Card title="AWS S3" icon="aws" href="/object-storage/aws-s3">
+    Amazon S3 and compatible services
+  </Card>
+  <Card title="Google Cloud Storage" icon="google" href="/object-storage/google-cloud-storage">
+    Google Cloud Storage (GCS)
+  </Card>
+  <Card title="Azure Blob Storage" icon="microsoft" href="/object-storage/azure-blob">
+    Microsoft Azure Blob Storage
+  </Card>
+  <Card title="S3-Compatible" icon="server" href="/object-storage/s3-compatible">
+    MinIO, LocalStack, and other S3-compatible services
+  </Card>
+</CardGroup>
+
+## How Object Storage Works with SlateDB
+
+SlateDB uses object storage to persist:
+
+- **SST files**: Sorted string tables containing your data
+- **WAL segments**: Write-ahead log for durability
+- **Manifest files**: Metadata about database state and structure
+
+```rust
+use slatedb::Db;
+use std::sync::Arc;
+
+// Create an object store (example using in-memory)
+let object_store = Arc::new(object_store::memory::InMemory::new());
+
+// Open SlateDB with the object store
+let db = Db::open("/tmp/slatedb", object_store).await?;
+
+// Use the database
+db.put(b"key", b"value").await?;
+let value = db.get(b"key").await?;
+
+db.close().await?;
+```
+
+## Choosing an Object Storage Backend
+
+Consider these factors when selecting an object storage backend:
+
+### Performance
+- **Latency**: Choose a region close to your compute resources
+- **Throughput**: Ensure the service can handle your workload's read/write volume
+- **Consistency**: SlateDB requires strong consistency guarantees
+
+### Cost
+- **Storage costs**: Price per GB stored
+- **Request costs**: Price per GET/PUT operation
+- **Data transfer**: Egress charges for data leaving the cloud
+
+### Operational Considerations
+- **Authentication**: How you manage credentials and access control
+- **Availability**: SLA and redundancy requirements
+- **Compliance**: Data residency and regulatory requirements
+
+<Warning>
+  SlateDB requires object stores that support conditional PUT operations (like ETag matching) to ensure consistency. Make sure your chosen backend supports this feature.
+</Warning>
+
+## Environment Variables
+
+Most object storage backends can be configured using environment variables, which is useful for production deployments:
+
+```bash
+# AWS S3
+export AWS_REGION=us-east-1
+export AWS_ACCESS_KEY_ID=your-access-key
+export AWS_SECRET_ACCESS_KEY=your-secret-key
+export AWS_BUCKET_NAME=your-bucket
+
+# Azure
+export AZURE_STORAGE_ACCOUNT_NAME=your-account
+export AZURE_STORAGE_ACCESS_KEY=your-key
+export AZURE_STORAGE_CONTAINER_NAME=your-container
+
+# Google Cloud Storage
+export GOOGLE_SERVICE_ACCOUNT=path/to/credentials.json
+export GCS_BUCKET_NAME=your-bucket
+```
+
+## Next Steps
+
+Choose your object storage backend to get started:
+
+- [AWS S3 Setup](/object-storage/aws-s3)
+- [Google Cloud Storage Setup](/object-storage/google-cloud-storage)
+- [Azure Blob Storage Setup](/object-storage/azure-blob)
+- [S3-Compatible Services](/object-storage/s3-compatible)

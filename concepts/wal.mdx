@@ -1,0 +1,587 @@
+---
+title: Write-Ahead Log (WAL)
+description: Understanding SlateDB's WAL, durability guarantees, recovery process, and design decisions
+---
+
+## What is the WAL?
+
+The Write-Ahead Log (WAL) is a critical component that ensures durability in SlateDB. Unlike traditional databases where the WAL is a separate log file, SlateDB's WAL consists of a series of immutable SSTable files stored in object storage.
+
+<Info>
+**Unique Design**: SlateDB doesn't write to the WAL on every `put()` call. Instead, it batches writes in memory (MemTable) and periodically flushes complete SSTs to the WAL. This design is optimized for object storage's high per-operation latency.
+</Info>
+
+## WAL Structure
+
+### Directory Layout
+
+The WAL is stored in object storage with a simple sequential structure:
+
+```
+some-bucket/
+├─ wal/
+│  ├─ 00000000000000000000.sst
+│  ├─ 00000000000000000001.sst
+│  ├─ 00000000000000000002.sst
+│  ├─ ...
+```
+
+**Source:** RFC 0001 (Manifest Design)
+
+Key characteristics:
+- **Sequential naming**: 20-digit zero-padded numbers (fits u64::MAX)
+- **Contiguous**: No gaps in the sequence
+- **Immutable**: Once written, WAL SSTs are never modified
+- **SST format**: Uses the same format as compacted SSTs
+
+### Why SST Format?
+
+Traditional WAL formats are optimized for append-only writes:
+```
+[record1][record2][record3]...
+```
+
+SlateDB uses SSTs for the WAL because:
+
+1. **Batched Writes**: Multiple key-value pairs are flushed together
+2. **Sorted Data**: MemTable data is already sorted
+3. **Compression**: Sorted data compresses better
+4. **Unified Codebase**: No need to maintain separate WAL format
+5. **Block Structure**: Enables efficient partial reads during recovery
+
+**Source:** RFC 0001, RFC 0014 (WAL on-disk format - rejected)
+
+<Note>
+**RFC 0014 Note**: SlateDB considered a specialized WAL format but rejected it because the SST format was already well-suited for batched, sorted writes. The only missing feature was bloom filters, which aren't needed for WAL recovery anyway.
+</Note>
+
+### WAL SST Structure
+
+```
+WAL SST (e.g., 00000000000000000005.sst)
++------------------+
+| Data Block 0     | <- sorted key-value pairs from MemTable
++------------------+
+| Data Block 1     |
++------------------+
+| ...              |
++------------------+
+| Index Block      | <- block offsets for recovery
++------------------+
+| Footer           | <- format version, metadata offset
++------------------+
+```
+
+Notable differences from compacted SSTs:
+- **No bloom filter** (WAL is always read sequentially during recovery)
+- **Writer epoch metadata** (stored in object metadata for fencing)
+- **Sequence numbers** (used for ordering during recovery)
+
+### Writer Epoch Metadata
+
+Each WAL SST includes writer epoch information:
+
+```rust
+// Object metadata (S3 user-defined metadata)
+let metadata = vec![
+    ("writer_epoch".to_string(), self.writer_epoch.to_string())
+];
+```
+
+**Source:** RFC 0001 (Manifest Design - Attributes)
+
+The writer epoch enables:
+- **Fencing zombie writers**: Old writers detect they've been superseded
+- **Recovery validation**: Ensure WAL SSTs are from the correct writer
+- **Split-brain prevention**: Only one writer can make progress
+
+## Durability Guarantees
+
+### Strong Durability (Default)
+
+By default, `put()` returns a future that resolves when data is durable:
+
+```rust
+// This await completes when data is in object storage
+db.put(b"key", b"value").await?;
+```
+
+**Durability guarantee:**
+- Data is written to object storage
+- Object storage acknowledges the write
+- Manifest is updated to reference the new WAL SST
+- Writer holds the current writer epoch
+
+**Source:** README.md:17-19
+
+### Weak Durability (Opt-in)
+
+For lower latency, writes can return before durability:
+
+```rust
+db.put_with_options(
+    b"key",
+    b"value",
+    PutOptions::default().with_await_durable(false)
+).await?;
+```
+
+**Durability guarantee:**
+- Data is in the MemTable (in-memory)
+- Will be written to object storage within `flush_interval`
+- May be lost if process crashes before flush
+
+<Tip>
+**Use Cases**: Weak durability is suitable for caches, metrics, logs, or other data where occasional loss is acceptable in exchange for lower latency.
+</Tip>
+
+## Write Flow
+
+### 1. Write to MemTable
+
+```rust
+impl Db {
+    pub async fn put(&self, key: &[u8], value: &[u8]) -> Result<(), SlateDBError> {
+        let seq = self.oracle.next_seq();
+        let entry = RowEntry::new(
+            Bytes::copy_from_slice(key),
+            seq,
+            RowValue::Value(Bytes::copy_from_slice(value)),
+        );
+        self.state.write().memtable.put(entry)?;
+        // ...
+    }
+}
+```
+
+**Source:** `slatedb/src/db.rs`
+
+### 2. Freeze MemTable
+
+When the MemTable reaches `l0_sst_size_bytes`:
+
+```rust
+if memtable.size() >= settings.l0_sst_size_bytes {
+    let frozen = Arc::new(ImmutableMemtable::from(memtable));
+    state.imm_memtables.push(frozen);
+    state.memtable = Arc::new(KVTable::new());
+}
+```
+
+**Source:** `slatedb/src/mem_table_flush.rs`
+
+### 3. Flush to WAL
+
+```rust
+impl MemtableFlushTask {
+    async fn flush_imm_memtables(&mut self) -> Result<(), SlateDBError> {
+        for imm in &self.imm_memtables {
+            // Build SST from immutable MemTable
+            let mut builder = EncodedSsTableBuilder::new(/* ... */);
+            for entry in imm.iter() {
+                builder.add(entry)?;
+            }
+            
+            // Write to object storage
+            let encoded = builder.build()?;
+            let wal_id = self.next_wal_id();
+            self.table_store.write_wal_sst(wal_id, encoded).await?;
+            
+            // Track for manifest update
+            self.flushed_ssts.push(wal_id);
+        }
+        Ok(())
+    }
+}
+```
+
+**Source:** `slatedb/src/mem_table_flush.rs`
+
+### 4. Update Manifest
+
+```rust
+let new_manifest = Manifest {
+    wal_id_last_seen: self.flushed_ssts.last().unwrap(),
+    l0_last_compacted: manifest.l0_last_compacted,
+    // ...
+};
+
+// Atomic CAS update
+self.manifest_store.write_manifest(
+    new_manifest,
+    Some(manifest.id)
+).await?;
+```
+
+**Source:** `slatedb/src/manifest/store.rs`
+
+### 5. Acknowledge Write
+
+Once the manifest is updated, all pending `put()` futures are resolved:
+
+```rust
+impl WatchableOnceCell<Result<(), SlateDBError>> {
+    pub fn set(&self, value: Result<(), SlateDBError>) {
+        self.cell.set(value.clone()).ok();
+        self.notify.notify_waiters();
+    }
+}
+```
+
+**Source:** `slatedb/src/utils.rs`, `slatedb/src/mem_table.rs:92-93`
+
+<Info>
+**Notification Mechanism**: Each MemTable tracks a `WatchableOnceCell` that allows callers to efficiently wait for durability without polling. When the flush completes, all waiters are notified simultaneously.
+</Info>
+
+## Recovery Process
+
+When SlateDB starts, it must recover state from the WAL:
+
+### 1. Read Current Manifest
+
+```rust
+let manifest = manifest_store.read_current_manifest().await?;
+```
+
+### 2. Find WAL SSTs to Replay
+
+```rust
+let wal_start_id = manifest.wal_id_last_compacted + 1;
+let wal_end_id = manifest.wal_id_last_seen;
+
+let wal_ssts_to_replay = table_store
+    .list_wal_ssts(wal_start_id..=wal_end_id)
+    .await?;
+```
+
+**Source:** `slatedb/src/wal_replay.rs`
+
+The manifest tracks:
+- **`wal_id_last_compacted`**: Last WAL SST that was merged into L0
+- **`wal_id_last_seen`**: Last WAL SST that was written
+
+Recovery only replays SSTs between these two markers.
+
+### 3. Replay WAL SSTs
+
+```rust
+impl WalReplayIterator {
+    pub async fn next(&mut self) -> Result<Option<RowEntry>, SlateDBError> {
+        // Read entries from WAL SSTs in order
+        while let Some(wal_sst) = self.current_wal_sst.as_mut() {
+            if let Some(entry) = wal_sst.next().await? {
+                return Ok(Some(entry));
+            }
+            // Move to next WAL SST
+            self.advance_to_next_wal_sst().await?;
+        }
+        Ok(None)
+    }
+}
+```
+
+**Source:** `slatedb/src/wal_replay.rs`
+
+### 4. Rebuild MemTable
+
+```rust
+let mut memtable = KVTable::new();
+let mut replay_iter = WalReplayIterator::new(/* ... */);
+
+while let Some(entry) = replay_iter.next().await? {
+    memtable.put(entry)?;
+}
+
+state.memtable = Arc::new(memtable);
+```
+
+### 5. Fence Old Writers
+
+After recovery, the new writer increments the writer epoch:
+
+```rust
+let new_epoch = manifest.writer_epoch + 1;
+let new_manifest = Manifest {
+    writer_epoch: new_epoch,
+    // ...
+};
+
+manifest_store.write_manifest(
+    new_manifest,
+    Some(manifest.id)
+).await?;
+```
+
+**Source:** RFC 0001 (Writer Protocol)
+
+Then writes a fencing SST:
+
+```rust
+let fencing_sst_id = self.next_wal_id();
+let empty_sst = EncodedSsTableBuilder::new(/* ... */).build()?;
+
+self.table_store.write_wal_sst_with_cas(
+    fencing_sst_id,
+    empty_sst,
+    new_epoch
+).await?;
+```
+
+This empty SST marks the boundary where the new writer took over.
+
+<Note>
+**Fencing Invariant**: All older writers will eventually see this fencing SST (when they try to write the next WAL SST) and realize they've been superseded. They will then halt to prevent corruption.
+</Note>
+
+## WAL Compaction
+
+WAL SSTs are eventually compacted into L0:
+
+```
+[WAL SST 0] ---+
+[WAL SST 1] ---+--> [Compaction] --> [L0 SST 100]
+[WAL SST 2] ---+
+```
+
+After compaction:
+1. New L0 SST is written to `compacted/` directory
+2. Manifest is updated with new L0 SST
+3. `wal_id_last_compacted` is advanced
+4. Old WAL SSTs can be garbage collected
+
+**Source:** RFC 0002 (Compaction - WAL->L0)
+
+The compaction scheduler tracks which WAL SSTs have been compacted:
+
+```rust
+pub struct ManifestCore {
+    pub(crate) wal_id_last_compacted: u64,
+    pub(crate) l0: VecDeque<SsTableHandle>,
+    // ...
+}
+```
+
+**Source:** `slatedb/src/db_state.rs`, RFC 0002
+
+## Writer Fencing
+
+Fencing prevents multiple writers from corrupting the database:
+
+### Writer Epoch Protocol
+
+1. **On startup**: New writer increments `writer_epoch` in manifest (via CAS)
+2. **Write fencing SST**: Empty SST with new epoch to next WAL position
+3. **Check on write**: Before each write, check if a higher epoch exists
+4. **Halt if fenced**: If higher epoch detected, stop all writes
+
+**Example timeline:**
+
+```
+time 0: [WAL SST 0, writer_epoch=1]
+time 1: [WAL SST 1, writer_epoch=1]
+--- Writer 2 starts ---
+time 2: [WAL SST 2, writer_epoch=2] (fencing SST)
+--- Writer 1 tries to write ---
+time 3: [WAL SST 2, writer_epoch=1] (FAILS, higher epoch exists)
+--- Writer 1 halts ---
+time 4: [WAL SST 3, writer_epoch=2] (Writer 2 continues)
+```
+
+**Source:** RFC 0001 (Writer Protocol - Examples)
+
+### CAS on Object Storage
+
+WAL writes use Compare-And-Swap to detect conflicts:
+
+**With native CAS (GCS, Azure):**
+```rust
+let result = object_store.put_with_mode(
+    &path,
+    data,
+    PutMode::Create,  // Fail if exists
+).await;
+```
+
+**Without CAS (S3):**
+SlateDB uses a two-phase protocol with DynamoDB:
+
+1. Write WAL SST to temporary location
+2. Write record to DynamoDB (atomic)
+3. Copy to final location
+4. Update DynamoDB record as completed
+5. Delete temporary object
+
+**Source:** RFC 0001 (Two-Phase CAS Protocol)
+
+## Separate WAL Object Store
+
+For lower write latency, the WAL can use a separate object store:
+
+```rust
+let db = Db::open_with_opts(
+    "my-db",
+    settings,
+    Arc::new(S3Store::new()),  // Main store (S3 Standard)
+    Some(Arc::new(S3ExpressStore::new())),  // WAL store (S3 Express)
+).await?;
+```
+
+**Source:** RFC 0009 (Separate WAL Object Store)
+
+**Layout:**
+```
+WAL Store (S3 Express One Zone):
+├─ wal/
+│  ├─ 00000000000000000000.sst
+│  └─ ...
+
+Main Store (S3 Standard):
+├─ manifest/
+│  └─ ...
+└─ compacted/
+   └─ ...
+```
+
+Benefits:
+- **Lower latency**: WAL writes complete faster (1-10ms vs 10-100ms)
+- **Lower cost**: Most data in cheaper storage
+- **Flexibility**: Can use local disk, separate region, etc.
+
+<Tip>
+**Production Recommendation**: Use S3 Express One Zone for WAL and S3 Standard for compacted data. This provides the best balance of latency, durability, and cost.
+</Tip>
+
+## WAL Garbage Collection
+
+Old WAL SSTs are deleted after compaction:
+
+```rust
+impl GarbageCollector {
+    async fn collect_wal_ssts(&self) -> Result<(), SlateDBError> {
+        let manifest = self.manifest_store.read_current_manifest().await?;
+        let wal_ssts = self.table_store.list_wal_ssts(..).await?;
+        
+        for wal_sst in wal_ssts {
+            if wal_sst.id.unwrap_wal_id() < manifest.wal_id_last_compacted {
+                self.table_store.delete_wal_sst(wal_sst.id).await?;
+            }
+        }
+        
+        Ok(())
+    }
+}
+```
+
+**Source:** `slatedb/src/garbage_collector/wal_gc.rs`
+
+GC safety:
+- Only delete WAL SSTs < `wal_id_last_compacted`
+- Keep the SST at `wal_id_last_compacted` for recovery
+- Respect active snapshots (they may reference older WAL SSTs)
+
+## Performance Characteristics
+
+### Write Latency
+
+**With S3 Standard:**
+- `await_durable=true`: 100-500ms (p50), 500ms-2s (p99)
+- `await_durable=false`: &lt;1ms (in-memory write)
+
+**With S3 Express One Zone:**
+- `await_durable=true`: 10-50ms (p50), 50-200ms (p99)
+- `await_durable=false`: &lt;1ms (in-memory write)
+
+### Write Throughput
+
+**Single Writer:**
+- Bottleneck: Object storage PUT latency
+- Maximum: ~1000 WAL SSTs/sec (limited by `flush_interval`)
+- Typical: 10-100 WAL SSTs/sec
+
+**Aggregate Throughput:**
+- Depends on MemTable size and `flush_interval`
+- With 1MB MemTable and 1s flush: ~1 MB/s sustained
+- With 16MB MemTable and 5s flush: ~3 MB/s sustained
+
+### Recovery Time
+
+**Typical:**
+- 1 WAL SST: &lt;100ms
+- 10 WAL SSTs: 500ms-1s
+- 100 WAL SSTs: 5-10s
+
+**Factors:**
+- Object storage GET latency
+- WAL SST size
+- Number of SSTs to replay
+- Network bandwidth
+
+<Info>
+**Recovery Optimization**: Keep `l0_sst_size_bytes` reasonable (1-16MB) to avoid large recovery times. The compactor will merge L0 SSTs into larger compacted SSTs for efficient reads.
+</Info>
+
+## Trade-offs
+
+### Advantages
+
+✅ **Object storage durability**: Inherits 11 9's durability from S3
+✅ **Batched writes**: Amortizes object storage latency
+✅ **Unified format**: No separate WAL format to maintain
+✅ **Compression**: Sorted data compresses well
+✅ **Simple recovery**: Just replay SSTs in order
+
+### Disadvantages
+
+❌ **Higher latency**: Object storage slower than local disk
+❌ **Coarse granularity**: Can't recover individual writes
+❌ **Flush interval trade-off**: Lower latency = higher cost
+❌ **Network dependency**: Writes require network round-trip
+
+## Best Practices
+
+### 1. Tune Flush Interval
+
+```rust
+// Low-latency (higher cost)
+Settings::default().with_flush_interval(Duration::from_millis(100))
+
+// Balanced
+Settings::default().with_flush_interval(Duration::from_secs(1))
+
+// High-throughput (lower cost, higher latency)
+Settings::default().with_flush_interval(Duration::from_secs(5))
+```
+
+### 2. Use Separate WAL Store
+
+```rust
+Db::open_with_opts(
+    path,
+    settings,
+    s3_standard_store,
+    Some(s3_express_store)  // Use low-latency store for WAL
+)
+```
+
+### 3. Monitor Flush Latency
+
+```rust
+let stats = db.stats();
+println!("Average flush latency: {}ms", stats.avg_flush_latency_ms);
+```
+
+### 4. Configure MemTable Size
+
+```rust
+Settings::default()
+    .with_l0_sst_size_bytes(16 * 1024 * 1024)  // 16MB
+    .with_l0_max_ssts(16)  // Back-pressure threshold
+```
+
+## Next Steps
+
+- Learn about [Compaction strategies](/concepts/compaction)
+- Understand [Object Storage trade-offs](/concepts/object-storage)
+- Explore [LSM-tree fundamentals](/concepts/lsm-tree)
+- Read [Architecture overview](/concepts/architecture)

@@ -1,0 +1,176 @@
+---
+title: Introduction to SlateDB
+description: An embedded storage engine built as a log-structured merge-tree on object storage
+---
+
+## What is SlateDB?
+
+SlateDB is an embedded storage engine built as a [log-structured merge-tree](https://en.wikipedia.org/wiki/Log-structured_merge-tree) (LSM-tree). Unlike traditional LSM-tree storage engines that write to local disk, SlateDB writes data directly to object storage services like S3, GCS, Azure Blob Storage, MinIO, and Tigris.
+
+<Note>
+SlateDB provides a cloud-native approach to embedded storage by leveraging object storage's unique characteristics while mitigating its limitations through intelligent caching and batching strategies.
+</Note>
+
+## Why SlateDB?
+
+Traditional embedded databases like RocksDB and LevelDB write to local disk, which presents challenges in cloud environments:
+
+- **Limited capacity**: Local disk storage is bounded by instance size
+- **Manual replication**: You need to implement your own replication logic
+- **Operational complexity**: Managing disk resources across distributed systems is challenging
+- **Durability concerns**: Local disk failures can cause data loss
+
+SlateDB solves these problems by embracing object storage:
+
+<CardGroup cols={3}>
+  <Card title="Bottomless Storage" icon="database">
+    No capacity limits - object storage scales automatically
+  </Card>
+  <Card title="Built-in Durability" icon="shield">
+    Object storage provides 99.999999999% durability out of the box
+  </Card>
+  <Card title="Easy Replication" icon="copy">
+    Leverage object storage's native replication capabilities
+  </Card>
+</CardGroup>
+
+## Architecture: LSM-Tree on Object Storage
+
+SlateDB implements a log-structured merge-tree that's optimized for object storage's characteristics:
+
+### Write Path
+
+1. **In-Memory Buffer**: Writes first go to an in-memory memtable
+2. **Write-Ahead Log (WAL)**: For durability, writes are batched and flushed to object storage WAL files
+3. **L0 SSTables**: When memtables reach a size threshold, they're frozen and written to L0 as sorted string tables (SSTs)
+4. **Compaction**: Background compaction merges L0 SSTs into larger, range-partitioned sorted runs
+
+<Note>
+SlateDB batches writes to mitigate object storage's higher PUT API costs. The `flush_interval` configuration controls write latency vs. API cost trade-offs.
+</Note>
+
+### Read Path
+
+SlateDB uses standard LSM-tree techniques optimized for object storage latency:
+
+- **Memtable reads**: Check in-memory data first
+- **Block cache**: In-memory cache for frequently accessed SST blocks
+- **Bloom filters**: Probabilistic data structures to avoid unnecessary reads
+- **Disk cache**: Local SST cache to reduce object storage GET operations
+- **Compression**: Reduces data transfer from object storage
+
+<Warning>
+Object storage has higher latency than local disk. SlateDB mitigates this through aggressive caching, but the first read of cold data will be slower than disk-based systems.
+</Warning>
+
+## Key Features
+
+### Core Operations
+
+- **CRUD operations**: Get, put, delete with async/await support
+- **Range queries**: Efficient scanning over key ranges
+- **Batch writes**: Atomic multi-key writes for better performance
+- **Transactions**: ACID transactions with configurable isolation levels
+
+### Performance Optimizations
+
+- **Block cache**: Configurable in-memory block caching (Moka or Foyer)
+- **Disk cache**: Local filesystem cache for SST files
+- **Compression**: Snappy, Zlib, LZ4, and Zstd support
+- **Bloom filters**: Configurable false positive rates
+- **Compaction**: Size-tiered compaction strategy
+
+### Advanced Capabilities
+
+- **Snapshots**: Point-in-time consistent views
+- **Checkpoints**: Named snapshots with lifecycle management
+- **Change Data Capture (CDC)**: Stream database changes
+- **Merge operators**: Custom merge logic for read-modify-write patterns
+- **Clones**: Efficient database copies sharing underlying data
+
+## Use Cases
+
+<CardGroup cols={2}>
+  <Card title="Serverless Applications" icon="bolt">
+    Ideal for serverless workloads where instance storage is ephemeral. SlateDB persists data to object storage while providing low-latency reads through caching.
+  </Card>
+  <Card title="Multi-Region Systems" icon="globe">
+    Leverage object storage replication for disaster recovery and geographic distribution. Secondary readers can consume data from replicated buckets.
+  </Card>
+  <Card title="Analytics Workloads" icon="chart-line">
+    Separate compute from storage. Scale analytics nodes independently while sharing the same object storage dataset.
+  </Card>
+  <Card title="Edge Computing" icon="network-wired">
+    Run embedded databases at the edge with automatic backup to cloud object storage. No complex replication logic needed.
+  </Card>
+</CardGroup>
+
+## Trade-offs
+
+While SlateDB provides unique advantages, it's important to understand the trade-offs:
+
+### When to Use SlateDB
+
+- You need effectively unlimited storage capacity
+- You want built-in durability and replication
+- You're building cloud-native applications
+- You can tolerate higher write latency (configurable, typically 100ms+)
+- Your workload benefits from read caching
+
+### When to Use Traditional Embedded DBs
+
+- You need the absolute lowest latency for all operations
+- You're running on bare metal with reliable local disks
+- Your dataset fits comfortably on local storage
+- You need consistent single-digit millisecond writes
+
+<Note>
+SlateDB's `put_with_options` allows you to trade durability for latency by setting `await_durable` to `false`. This returns immediately after writing to the memtable, without waiting for the object storage flush.
+</Note>
+
+## Performance Characteristics
+
+### Write Performance
+
+- **Latency**: Controlled by `flush_interval` (default 100ms) plus network latency to object storage
+- **Throughput**: Limited by object storage PUT rate limits and bandwidth
+- **Cost**: Lower flush intervals = higher API costs (e.g., 100ms ≈ $130/month on S3)
+
+### Read Performance
+
+- **Cached reads**: Microsecond to low millisecond latency from memory/disk cache
+- **Cold reads**: Higher latency due to object storage network roundtrips
+- **Range scans**: Efficient with read-ahead and prefetching support
+
+## Object Storage Compatibility
+
+SlateDB uses the [object_store](https://docs.rs/object_store/latest/object_store/) crate and supports any implementation of the `ObjectStore` trait:
+
+- **Amazon S3**: Including S3-compatible services (MinIO, Tigris, etc.)
+- **Google Cloud Storage**: Native GCS support
+- **Azure Blob Storage**: Native Azure support
+- **In-Memory**: For testing and development
+- **Local Filesystem**: For development and testing
+
+## Language Support
+
+While SlateDB is written in Rust, it offers bindings for multiple languages:
+
+- **Rust**: First-class native support
+- **Go**: Official bindings
+- **Java**: Official bindings
+- **Python**: Official bindings
+- **TypeScript/Node.js**: Community bindings
+- **.NET**: Community bindings
+- **Ruby**: Community bindings
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Get started with SlateDB in minutes
+  </Card>
+  <Card title="Installation" icon="download" href="/installation">
+    Learn how to add SlateDB to your project
+  </Card>
+</CardGroup>

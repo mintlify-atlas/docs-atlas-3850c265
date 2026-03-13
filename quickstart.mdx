@@ -1,80 +1,391 @@
 ---
-title: "Quickstart"
-description: "Start building awesome documentation in minutes"
+title: Quickstart Guide
+description: Get started with SlateDB in under 5 minutes
 ---
 
-## Get started in three steps
+This guide will help you set up SlateDB and perform basic operations. We'll start with a simple in-memory example, then show you how to use real object storage backends.
 
-Get your documentation site running locally and make your first customization.
+## Prerequisites
 
-### Step 1: Set up your local environment
+- Rust 1.70 or later
+- Tokio runtime for async operations
+- Basic familiarity with async/await in Rust
 
-<AccordionGroup>
-  <Accordion icon="copy" title="Clone your docs locally">
-    During the onboarding process, you created a GitHub repository with your docs content if you didn't already have one. You can find a link to this repository in your [dashboard](https://dashboard.mintlify.com).
+## Basic Example
+
+Let's start with a simple example using in-memory object storage:
+
+<Steps>
+  <Step title="Add Dependencies">
+    Add SlateDB to your `Cargo.toml`:
+
+    ```toml Cargo.toml
+    [dependencies]
+    slatedb = "*"
+    tokio = { version = "*", features = ["full"] }
+    ```
+  </Step>
+
+  <Step title="Create a Database">
+    Create a new database instance with in-memory storage:
+
+    ```rust
+    use slatedb::{Db, Error};
+    use slatedb::object_store::memory::InMemory;
+    use std::sync::Arc;
+
+    #[tokio::main]
+    async fn main() -> Result<(), Error> {
+        // Create an in-memory object store
+        let object_store = Arc::new(InMemory::new());
+        
+        // Open the database
+        let db = Db::open("/tmp/my_slatedb", object_store).await?;
+        
+        println!("Database opened successfully!");
+        Ok(())
+    }
+    ```
+
+    <Note>
+    The path `/tmp/my_slatedb` is used as a logical namespace. With in-memory storage, no actual files are created.
+    </Note>
+  </Step>
+
+  <Step title="Write Data">
+    Insert key-value pairs into the database:
+
+    ```rust
+    // Put a single key-value pair
+    db.put(b"hello", b"world").await?;
     
-    To clone the repository locally so that you can make and preview changes to your docs, follow the [Cloning a repository](https://docs.github.com/en/repositories/creating-and-managing-repositories/cloning-a-repository) guide in the GitHub docs.
-  </Accordion>
-  <Accordion icon="rectangle-terminal" title="Start the preview server">
-    1. Install the Mintlify CLI: `npm i -g mint`
-    2. Navigate to your docs directory and run: `mint dev`
-    3. Open `http://localhost:3000` to see your docs live!
+    // The put() call blocks until data is durably persisted to object storage
+    println!("Data written successfully!");
+    ```
+
+    <Warning>
+    By default, `put()` waits for the data to be flushed to object storage. For lower latency at the cost of durability, use `put_with_options` with `await_durable: false`.
+    </Warning>
+  </Step>
+
+  <Step title="Read Data">
+    Retrieve values by key:
+
+    ```rust
+    // Get a value by key
+    match db.get(b"hello").await? {
+        Some(value) => println!("Value: {:?}", value),
+        None => println!("Key not found"),
+    }
+    ```
+  </Step>
+
+  <Step title="Delete Data">
+    Remove keys from the database:
+
+    ```rust
+    // Delete a key
+    db.delete(b"hello").await?;
     
-    <Tip>Your preview updates automatically as you edit files.</Tip>
-  </Accordion>
-</AccordionGroup>
+    // Verify deletion
+    assert!(db.get(b"hello").await?.is_none());
+    ```
+  </Step>
 
-### Step 2: Deploy your changes
+  <Step title="Close the Database">
+    Always close the database gracefully:
 
-<AccordionGroup>
-  <Accordion icon="github" title="Install our GitHub app">
-    Install the Mintlify GitHub app from your [dashboard](https://dashboard.mintlify.com/settings/organization/github-app).
+    ```rust
+    // Close the database (flushes any pending writes)
+    db.close().await?;
+    ```
+  </Step>
+</Steps>
+
+## Complete Example
+
+Here's a complete working example with all CRUD operations:
+
+```rust
+use slatedb::{Db, Error};
+use slatedb::object_store::memory::InMemory;
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> Result<(), Error> {
+    // Setup
+    let object_store = Arc::new(InMemory::new());
+    let db = Db::open("/tmp/quickstart_example", object_store).await?;
+
+    // Put
+    db.put(b"key1", b"value1").await?;
+    println!("Inserted key1");
+
+    // Get
+    if let Some(value) = db.get(b"key1").await? {
+        println!("Retrieved: {:?}", value);
+    }
+
+    // Update (overwrite)
+    db.put(b"key1", b"updated_value").await?;
+    println!("Updated key1");
+
+    // Delete
+    db.delete(b"key1").await?;
+    println!("Deleted key1");
+
+    // Verify deletion
+    assert!(db.get(b"key1").await?.is_none());
+
+    // Close
+    db.close().await?;
+    println!("Database closed");
+
+    Ok(())
+}
+```
+
+## Range Queries
+
+SlateDB supports efficient range queries for scanning multiple keys:
+
+```rust
+use slatedb::{Db, Error};
+use slatedb::object_store::memory::InMemory;
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> Result<(), Error> {
+    let object_store = Arc::new(InMemory::new());
+    let db = Db::open("/tmp/range_example", object_store).await?;
+
+    // Insert multiple keys
+    db.put(b"user:1", b"Alice").await?;
+    db.put(b"user:2", b"Bob").await?;
+    db.put(b"user:3", b"Charlie").await?;
+    db.put(b"user:4", b"David").await?;
+
+    // Scan over a range
+    let mut iter = db.scan(b"user:1"..=b"user:3").await?;
+    while let Some(kv) = iter.next().await? {
+        println!("Key: {:?}, Value: {:?}", kv.key, kv.value);
+    }
+
+    // Scan all keys
+    let mut iter = db.scan::<Vec<u8>, _>(..).await?;
+    while let Some(kv) = iter.next().await? {
+        println!("Key: {:?}, Value: {:?}", kv.key, kv.value);
+    }
+
+    // Seek to a specific key and continue
+    let mut iter = db.scan::<Vec<u8>, _>(..).await?;
+    iter.seek(b"user:3").await?;
+    if let Some(kv) = iter.next().await? {
+        println!("Found: {:?} = {:?}", kv.key, kv.value);
+    }
+
+    db.close().await?;
+    Ok(())
+}
+```
+
+## Using Object Storage Backends
+
+Now let's connect SlateDB to real object storage services:
+
+<CodeGroup>
+```rust AWS S3
+use object_store::aws::AmazonS3Builder;
+use object_store::aws::S3ConditionalPut;
+use slatedb::Db;
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let object_store = Arc::new(
+        AmazonS3Builder::new()
+            .with_bucket_name("my-slatedb-bucket")
+            .with_region("us-east-1")
+            .with_access_key_id("YOUR_ACCESS_KEY")
+            .with_secret_access_key("YOUR_SECRET_KEY")
+            .with_conditional_put(S3ConditionalPut::ETagMatch)
+            .build()?,
+    );
+
+    let db = Db::open("/my-app/db", object_store).await?;
     
-    Our GitHub app automatically deploys your changes to your docs site, so you don't need to manage deployments yourself.
-</Accordion>
-<Accordion icon="palette" title="Update your site name and colors">
-    For a first change, let's update the name and colors of your docs site.
+    // Use the database...
+    db.put(b"key", b"value").await?;
+    
+    db.close().await?;
+    Ok(())
+}
+```
 
-    1. Open `docs.json` in your editor.
-    2. Change the `"name"` field to your project name.
-    3. Update the `"colors"` to match your brand.
-    4. Save and see your changes instantly at `http://localhost:3000`.
+```rust S3-Compatible (MinIO, Tigris)
+use object_store::aws::AmazonS3Builder;
+use object_store::aws::S3ConditionalPut;
+use slatedb::Db;
+use std::sync::Arc;
 
-    <Tip>Try changing the primary color to see an immediate difference!</Tip>
-  </Accordion>
-</AccordionGroup>
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let object_store = Arc::new(
+        AmazonS3Builder::new()
+            .with_endpoint("http://localhost:9000") // MinIO endpoint
+            .with_bucket_name("slatedb")
+            .with_region("us-east-1")
+            .with_access_key_id("minioadmin")
+            .with_secret_access_key("minioadmin")
+            .with_allow_http(true)
+            .with_conditional_put(S3ConditionalPut::ETagMatch)
+            .build()?,
+    );
 
-### Step 3: Go live
+    let db = Db::open("/tmp/slatedb_minio", object_store).await?;
+    
+    db.put(b"key", b"value").await?;
+    
+    db.close().await?;
+    Ok(())
+}
+```
 
-<Accordion icon="rocket" title="Publish your docs">
-  1. Commit and push your changes.
-  2. Your docs will update and be live in moments!
-</Accordion>
+```rust Google Cloud Storage
+use object_store::gcp::GoogleCloudStorageBuilder;
+use slatedb::Db;
+use std::sync::Arc;
 
-## Next steps
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let object_store = Arc::new(
+        GoogleCloudStorageBuilder::new()
+            .with_service_account_path("/path/to/service-account.json")
+            .with_bucket_name("my-slatedb-bucket")
+            .build()?,
+    );
 
-Now that you have your docs running, explore these key features:
+    let db = Db::open("/my-app/db", object_store).await?;
+    
+    db.put(b"key", b"value").await?;
+    
+    db.close().await?;
+    Ok(())
+}
+```
 
-<CardGroup cols={2}>
+```rust Azure Blob Storage
+use object_store::azure::MicrosoftAzureBuilder;
+use slatedb::Db;
+use std::sync::Arc;
 
-<Card title="Write Content" icon="pen-to-square" href="/essentials/markdown">
-  Learn MDX syntax and start writing your documentation.
-</Card>
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let object_store = Arc::new(
+        MicrosoftAzureBuilder::new()
+            .with_account("mystorageaccount")
+            .with_access_key("YOUR_ACCESS_KEY")
+            .with_container_name("slatedb-container")
+            .build()?,
+    );
 
-<Card title="Customize style" icon="palette" href="/essentials/settings">
-  Make your docs match your brand perfectly.
-</Card>
-
-<Card title="Add code examples" icon="square-code" href="/essentials/code">
-  Include syntax-highlighted code blocks.
-</Card>
-
-<Card title="API documentation" icon="code" href="/api-reference/introduction">
-  Auto-generate API docs from OpenAPI specs.
-</Card>
-
-</CardGroup>
+    let db = Db::open("/my-app/db", object_store).await?;
+    
+    db.put(b"key", b"value").await?;
+    
+    db.close().await?;
+    Ok(())
+}
+```
+</CodeGroup>
 
 <Note>
-  **Need help?** See our [full documentation](https://mintlify.com/docs) or join our [community](https://mintlify.com/community).
+Remember to replace placeholder credentials with your actual access keys. For production, use environment variables or IAM roles instead of hardcoding credentials.
 </Note>
+
+## Optimizing Write Latency
+
+By default, `put()` blocks until data is persisted to object storage. For lower latency, disable durability waiting:
+
+```rust
+use slatedb::config::{PutOptions, WriteOptions};
+
+// Create write options with immediate return
+let write_options = WriteOptions {
+    await_durable: false,
+};
+
+// Write 1000 keys without waiting for each flush
+for i in 0..1000 {
+    db.put_with_options(
+        format!("key{}", i).as_bytes(),
+        format!("value{}", i).as_bytes(),
+        &PutOptions::default(),
+        &write_options,
+    ).await?;
+}
+
+// Explicitly flush to ensure durability
+db.flush().await?;
+```
+
+<Warning>
+With `await_durable: false`, writes return immediately after being written to the in-memory WAL buffer. If the process crashes before the flush interval, unflushed writes may be lost.
+</Warning>
+
+## Reopening a Database
+
+SlateDB automatically recovers from previous state when reopening:
+
+```rust
+use slatedb::Db;
+use object_store::azure::MicrosoftAzureBuilder;
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let object_store = Arc::new(
+        MicrosoftAzureBuilder::new()
+            .with_account("myaccount")
+            .with_access_key("mykey")
+            .with_container_name("mycontainer")
+            .build()?,
+    );
+
+    let path = "/myapp/db";
+    
+    // First session: write data
+    {
+        let db = Db::open(path, object_store.clone()).await?;
+        db.put(b"persistent", b"data").await?;
+        db.close().await?;
+    }
+    
+    // Second session: data is still there
+    {
+        let db = Db::open(path, object_store).await?;
+        let value = db.get(b"persistent").await?;
+        assert_eq!(value, Some(b"data".to_vec().into()));
+        db.close().await?;
+    }
+
+    Ok(())
+}
+```
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Installation" icon="download" href="/installation">
+    Learn about feature flags and advanced installation options
+  </Card>
+  <Card title="Configuration" icon="sliders" href="/configuration">
+    Explore configuration options to tune performance
+  </Card>
+  <Card title="API Reference" icon="code" href="/api/db">
+    Browse the complete API documentation
+  </Card>
+  <Card title="Guides" icon="book" href="/guides/basic-operations">
+    See more advanced examples and patterns
+  </Card>
+</CardGroup>

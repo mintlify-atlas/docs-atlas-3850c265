@@ -1,0 +1,325 @@
+---
+title: GarbageCollectorBuilder
+description: Builder for configuring SlateDB garbage collector
+---
+
+## Overview
+
+The `GarbageCollectorBuilder` provides a way to configure and customize the garbage collector for a SlateDB database. The garbage collector is responsible for removing obsolete data from SlateDB storage.
+
+## Garbage Collection Targets
+
+The garbage collector manages cleanup for several types of data:
+
+1. **Write-Ahead Log (WAL) SSTs**: WAL files that are no longer referenced by active manifests or checkpoints
+2. **Compacted SSTs**: Compacted SSTable files that are no longer referenced by active manifests or checkpoints
+3. **Compactions Files**: Old compaction state files that are no longer needed
+4. **Manifests**: Old manifest files that are not needed for recovery or checkpoints
+
+## Running the Garbage Collector
+
+The garbage collector can run in two modes:
+
+1. **Async Task**: Continuously runs in the background with `GarbageCollector::run_async_task()`
+2. **One-Time**: Runs a single collection cycle with `GarbageCollector::run_gc_once()`
+
+## GarbageCollectorOptions
+
+The `GarbageCollectorOptions` struct configures garbage collection behavior for all managed directories.
+
+### Fields
+
+#### `manifest_options`
+
+**Type:** `Option<GarbageCollectorDirectoryOptions>`  
+**Default:** `Some(GarbageCollectorDirectoryOptions::default())`
+
+Garbage collection options for the manifest directory. Set to `None` to disable garbage collection for manifests.
+
+#### `wal_options`
+
+**Type:** `Option<GarbageCollectorDirectoryOptions>`  
+**Default:** `Some(GarbageCollectorDirectoryOptions::default())`
+
+Garbage collection options for the WAL directory. Set to `None` to disable garbage collection for WAL files.
+
+#### `compacted_options`
+
+**Type:** `Option<GarbageCollectorDirectoryOptions>`  
+**Default:** `Some(GarbageCollectorDirectoryOptions::default())`
+
+Garbage collection options for the compacted directory. Set to `None` to disable garbage collection for compacted SSTables.
+
+#### `compactions_options`
+
+**Type:** `Option<GarbageCollectorDirectoryOptions>`  
+**Default:** `Some(GarbageCollectorDirectoryOptions::default())`
+
+Garbage collection options for the compactions directory, which contains compactor job state `.compactions` files. Set to `None` to disable garbage collection for compactions files.
+
+## GarbageCollectorDirectoryOptions
+
+Configuration options for garbage collection of a specific directory.
+
+### Fields
+
+#### `interval`
+
+**Type:** `Option<Duration>`  
+**Default:** `Some(60s)`
+
+The interval at which the garbage collector will run in the background thread.
+
+If set to `None`, recurring garbage collection will be disabled for the directory, but one-time garbage collection can still be triggered via `GarbageCollector::run_gc_once()`.
+
+#### `min_age`
+
+**Type:** `Duration`  
+**Default:** `300s` (5 minutes)
+
+The minimum age of a file before it can be garbage collected. This ensures that recently created data isn't immediately deleted, which helps prevent removing files that might still be referenced by in-flight operations.
+
+## Default Configuration
+
+By default, garbage collection is enabled for all managed directories with:
+- **Interval**: 60 seconds (runs every minute)
+- **Minimum Age**: 300 seconds (files must be at least 5 minutes old)
+
+## Configuration Examples
+
+### TOML Format
+
+```toml
+[garbage_collector_options.manifest_options]
+interval = "300s"
+min_age = "86400s"
+
+[garbage_collector_options.wal_options]
+interval = "60s"
+min_age = "60s"
+
+[garbage_collector_options.compacted_options]
+interval = "300s"
+min_age = "86400s"
+
+[garbage_collector_options.compactions_options]
+interval = "300s"
+min_age = "86400s"
+```
+
+### JSON Format
+
+```json
+{
+  "garbage_collector_options": {
+    "manifest_options": {
+      "interval": "300s",
+      "min_age": "86400s"
+    },
+    "wal_options": {
+      "interval": "60s",
+      "min_age": "60s"
+    },
+    "compacted_options": {
+      "interval": "300s",
+      "min_age": "86400s"
+    },
+    "compactions_options": {
+      "interval": "300s",
+      "min_age": "86400s"
+    }
+  }
+}
+```
+
+### YAML Format
+
+```yaml
+garbage_collector_options:
+  manifest_options:
+    interval: '300s'
+    min_age: '86400s'
+  wal_options:
+    interval: '60s'
+    min_age: '60s'
+  compacted_options:
+    interval: '300s'
+    min_age: '86400s'
+  compactions_options:
+    interval: '300s'
+    min_age: '86400s'
+```
+
+## Disabling Garbage Collection
+
+To disable garbage collection for specific directories, set the corresponding option to `None`:
+
+### Via Configuration File
+
+```toml
+# Disable WAL garbage collection
+garbage_collector_options.wal_options = null
+
+# Other directories still use defaults
+[garbage_collector_options.manifest_options]
+interval = "300s"
+min_age = "86400s"
+```
+
+### Programmatically
+
+```rust
+use slatedb::config::{Settings, GarbageCollectorOptions};
+
+let mut settings = Settings::default();
+if let Some(gc_opts) = settings.garbage_collector_options.as_mut() {
+    // Disable WAL garbage collection
+    gc_opts.wal_options = None;
+    
+    // Keep other GC tasks enabled with defaults
+}
+```
+
+## Checkpoints and Garbage Collection
+
+The garbage collector respects checkpoint references when determining what data to delete:
+
+- **Expired Checkpoints**: Automatically removed by the garbage collector
+- **Active Checkpoints**: Referenced manifests, WAL files, and SSTs are protected from deletion
+- **Checkpoint Lifetime**: Checkpoints can have optional expiration times
+
+### Example
+
+If a checkpoint references manifest ID 5, the garbage collector will:
+1. Keep manifest 5 and all files it references (WAL SSTs, compacted SSTs)
+2. Delete older unreferenced manifests (e.g., 1-4) if they meet the `min_age` threshold
+3. Retain the latest manifest even if it's old
+
+## Safety Considerations
+
+### Minimum Age Threshold
+
+The `min_age` threshold provides a safety buffer to prevent deleting files that might still be in use:
+
+- Files created less than `min_age` ago are never deleted
+- This protects against race conditions with concurrent operations
+- Recommended to keep at least 5 minutes (default) for most workloads
+
+### Active References
+
+The garbage collector checks multiple sources before deleting:
+
+1. **Latest Manifest**: Always retained
+2. **Checkpoint References**: Manifests and data referenced by active checkpoints
+3. **Compaction Low-Watermark**: SSTs being compacted are protected
+4. **Recent Data**: Files newer than `min_age` are protected
+
+## Metrics
+
+The garbage collector exposes several metrics:
+
+- `gc.manifest_count`: Number of manifests collected
+- `gc.wal_count`: Number of WAL SSTs collected
+- `gc.compacted_count`: Number of compacted SSTs collected
+- `gc.compactions_count`: Number of compactions files collected
+- `gc.count`: Total number of garbage collection cycles run
+
+## Example Usage
+
+### Using Default Configuration
+
+```rust
+use slatedb::config::Settings;
+use slatedb::db::Db;
+use std::sync::Arc;
+use object_store::memory::InMemory;
+
+// Garbage collection is enabled by default
+let db = Db::builder("/path/to/db", Arc::new(InMemory::new()))
+    .build()
+    .await?;
+```
+
+### Custom Configuration
+
+```rust
+use slatedb::config::{
+    Settings, 
+    GarbageCollectorOptions,
+    GarbageCollectorDirectoryOptions
+};
+use std::time::Duration;
+
+let mut settings = Settings::default();
+
+let mut gc_opts = GarbageCollectorOptions::default();
+
+// More aggressive WAL cleanup (every 30s, files > 1 minute old)
+gc_opts.wal_options = Some(GarbageCollectorDirectoryOptions {
+    interval: Some(Duration::from_secs(30)),
+    min_age: Duration::from_secs(60),
+});
+
+// Less frequent manifest cleanup (every 10 minutes, files > 1 day old)
+gc_opts.manifest_options = Some(GarbageCollectorDirectoryOptions {
+    interval: Some(Duration::from_secs(600)),
+    min_age: Duration::from_secs(86400),
+});
+
+// Disable compactions file cleanup
+gc_opts.compactions_options = None;
+
+settings.garbage_collector_options = Some(gc_opts);
+
+let db = Db::builder("/path/to/db", Arc::new(InMemory::new()))
+    .with_settings(settings)
+    .build()
+    .await?;
+```
+
+### Using Environment Variables
+
+```bash
+# Configure WAL garbage collection
+export SLATEDB_GARBAGE_COLLECTOR_OPTIONS.WAL_OPTIONS.INTERVAL=30s
+export SLATEDB_GARBAGE_COLLECTOR_OPTIONS.WAL_OPTIONS.MIN_AGE=60s
+
+# Configure manifest garbage collection  
+export SLATEDB_GARBAGE_COLLECTOR_OPTIONS.MANIFEST_OPTIONS.INTERVAL=600s
+export SLATEDB_GARBAGE_COLLECTOR_OPTIONS.MANIFEST_OPTIONS.MIN_AGE=86400s
+```
+
+### One-Time Garbage Collection
+
+```rust
+use slatedb::garbage_collector::GarbageCollector;
+
+// Create garbage collector instance
+let gc = GarbageCollector::new(
+    manifest_store,
+    compactions_store,
+    table_store,
+    gc_options,
+    stat_registry,
+    system_clock,
+);
+
+// Run garbage collection once
+gc.run_gc_once().await;
+```
+
+## Best Practices
+
+1. **Set Appropriate min_age**: Keep `min_age` at least 5 minutes to protect in-flight operations
+2. **Monitor Metrics**: Track GC metrics to ensure files are being cleaned up as expected
+3. **Checkpoint Management**: Use checkpoints with explicit lifetimes to prevent indefinite data retention
+4. **Storage Costs**: More aggressive GC (shorter intervals, lower min_age) reduces storage costs but increases object store LIST/DELETE operations
+5. **Workload Considerations**:
+   - High-write workloads: Use more aggressive WAL cleanup
+   - Long-running checkpoints: Increase `min_age` for manifest/compacted cleanup
+   - Low-frequency writes: Increase `interval` to reduce unnecessary GC cycles
+
+## See Also
+
+- [Settings](/api/settings) - Database configuration options
+- [CompactorBuilder](/api/compactor-builder) - Configure compaction behavior

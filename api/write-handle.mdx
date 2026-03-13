@@ -1,0 +1,200 @@
+---
+title: WriteHandle
+description: Handle returned by write operations containing metadata
+---
+
+The `WriteHandle` struct is returned by write operations (`put`, `delete`, `merge`, `write`) and contains metadata about the write operation.
+
+## Structure
+
+```rust
+pub struct WriteHandle {
+    pub(crate) seq: u64,
+    pub(crate) create_ts: i64,
+}
+```
+
+## Methods
+
+### seqnum()
+
+Returns the sequence number assigned to this write operation.
+
+```rust
+pub fn seqnum(&self) -> u64
+```
+
+<ResponseField name="u64" type="u64">
+  The sequence number assigned to the write operation. Sequence numbers are monotonically increasing and can be used to track the order of writes.
+</ResponseField>
+
+**Example:**
+
+```rust
+use slatedb::{Db, Error};
+use slatedb::object_store::memory::InMemory;
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> Result<(), Error> {
+    let object_store = Arc::new(InMemory::new());
+    let db = Db::open("test_db", object_store).await?;
+    
+    let handle = db.put(b"key", b"value").await?;
+    let seq = handle.seqnum();
+    println!("Write sequence number: {}", seq);
+    
+    Ok(())
+}
+```
+
+### create_ts()
+
+Returns the creation timestamp assigned to this write operation.
+
+```rust
+pub fn create_ts(&self) -> i64
+```
+
+<ResponseField name="i64" type="i64">
+  The creation timestamp (in milliseconds since the Unix epoch) assigned to the write operation.
+</ResponseField>
+
+**Example:**
+
+```rust
+use slatedb::{Db, Error};
+use slatedb::object_store::memory::InMemory;
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> Result<(), Error> {
+    let object_store = Arc::new(InMemory::new());
+    let db = Db::open("test_db", object_store).await?;
+    
+    let handle = db.put(b"key", b"value").await?;
+    let timestamp = handle.create_ts();
+    println!("Write timestamp: {}", timestamp);
+    
+    Ok(())
+}
+```
+
+## Usage Examples
+
+### Tracking Write Order
+
+```rust
+use slatedb::{Db, Error};
+use slatedb::object_store::memory::InMemory;
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> Result<(), Error> {
+    let object_store = Arc::new(InMemory::new());
+    let db = Db::open("test_db", object_store).await?;
+    
+    let handle1 = db.put(b"key1", b"value1").await?;
+    let handle2 = db.put(b"key2", b"value2").await?;
+    
+    // Sequence numbers are monotonically increasing
+    assert!(handle2.seqnum() > handle1.seqnum());
+    
+    Ok(())
+}
+```
+
+### Waiting for Durability
+
+```rust
+use slatedb::{Db, Error};
+use slatedb::config::WriteOptions;
+use slatedb::object_store::memory::InMemory;
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> Result<(), Error> {
+    let object_store = Arc::new(InMemory::new());
+    let db = Db::open("test_db", object_store).await?;
+    
+    // Write with durability guarantee
+    let handle = db.put(b"important_key", b"important_value").await?;
+    
+    // Get the sequence number
+    let seq = handle.seqnum();
+    
+    // Use db.subscribe() to wait for this sequence to become durable
+    let mut rx = db.subscribe();
+    rx.wait_for(|status| status.durable_seq >= seq)
+        .await
+        .expect("db dropped");
+    
+    println!("Write with sequence {} is now durable", seq);
+    
+    Ok(())
+}
+```
+
+### Batch Write Metadata
+
+```rust
+use slatedb::{WriteBatch, Db, Error};
+use slatedb::object_store::memory::InMemory;
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> Result<(), Error> {
+    let object_store = Arc::new(InMemory::new());
+    let db = Db::open("test_db", object_store).await?;
+    
+    let mut batch = WriteBatch::new();
+    batch.put(b"key1", b"value1");
+    batch.put(b"key2", b"value2");
+    batch.delete(b"key3");
+    
+    // All operations in the batch share the same sequence number and timestamp
+    let handle = db.write(batch).await?;
+    
+    println!("Batch sequence number: {}", handle.seqnum());
+    println!("Batch timestamp: {}", handle.create_ts());
+    
+    Ok(())
+}
+```
+
+### Custom Write Options
+
+```rust
+use slatedb::{Db, Error};
+use slatedb::config::WriteOptions;
+use slatedb::object_store::memory::InMemory;
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> Result<(), Error> {
+    let object_store = Arc::new(InMemory::new());
+    let db = Db::open("test_db", object_store).await?;
+    
+    // Write with custom options (not waiting for durability)
+    let handle = db.delete_with_options(
+        b"key",
+        &WriteOptions {
+            await_durable: false,
+        }
+    ).await?;
+    
+    // The handle is returned immediately, even though the write
+    // may not be durable yet
+    println!("Write initiated with sequence: {}", handle.seqnum());
+    
+    Ok(())
+}
+```
+
+## Notes
+
+- All write operations (`put`, `delete`, `merge`, `write`) return a `WriteHandle`
+- The sequence number is guaranteed to be unique and monotonically increasing
+- In a batch write, all operations in the batch share the same sequence number and timestamp
+- The timestamp is set by SlateDB's internal clock at the time the write is processed
+- You can use the sequence number with `db.subscribe()` to wait for the write to become durable

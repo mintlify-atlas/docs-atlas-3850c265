@@ -1,0 +1,231 @@
+---
+title: Basic Operations
+description: Learn how to perform fundamental read and write operations in SlateDB
+---
+
+This guide covers the essential operations for working with SlateDB: opening a database, writing data, reading data, and scanning ranges.
+
+## Opening a Database
+
+Before performing any operations, you need to open a database connection. SlateDB requires an object store backend.
+
+```rust
+use slatedb::object_store::memory::InMemory;
+use slatedb::{Db, Error};
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> Result<(), Error> {
+    let object_store = Arc::new(InMemory::new());
+    let db = Db::open("/tmp/my_database", object_store).await?;
+    
+    // Perform operations...
+    
+    db.close().await?;
+    Ok(())
+}
+```
+
+<Tip>
+Always call `db.close().await?` when you're done to ensure all data is properly flushed to storage.
+</Tip>
+
+## Writing Data
+
+### Put Operation
+
+The `put` operation writes a key-value pair to the database.
+
+```rust
+db.put(b"key", b"value").await?;
+```
+
+<Warning>
+Keys cannot be empty and must be &lt;= u16::MAX bytes. Values must be &lt;= u32::MAX bytes.
+</Warning>
+
+### Put with Options
+
+You can specify custom options like TTL (time-to-live) when writing data:
+
+```rust
+use slatedb::config::{PutOptions, Ttl};
+
+let options = PutOptions {
+    ttl: Ttl::ExpireAfter(3600), // expires in 1 hour (seconds)
+};
+
+db.put_with_options(b"temporary_key", b"temporary_value", &options).await?;
+```
+
+### Delete Operation
+
+Remove a key-value pair from the database:
+
+```rust
+db.delete(b"key_to_delete").await?;
+```
+
+## Reading Data
+
+### Get Operation
+
+Retrieve a value by its key:
+
+```rust
+match db.get(b"key").await? {
+    Some(value) => println!("Found: {:?}", value),
+    None => println!("Key not found"),
+}
+```
+
+The returned `Bytes` object contains a reference to a block in memory. If you need to hold the data for a long time, consider copying it:
+
+```rust
+if let Some(value) = db.get(b"key").await? {
+    let owned_data = value.to_vec(); // Copy the data
+}
+```
+
+### Get with Metadata
+
+To retrieve both the value and metadata (sequence number, timestamps):
+
+```rust
+use slatedb::types::KeyValue;
+
+if let Some(kv) = db.get_key_value(b"key").await? {
+    println!("Key: {:?}", kv.key);
+    println!("Value: {:?}", kv.value);
+    println!("Sequence: {}", kv.seq);
+    println!("Created: {:?}", kv.create_ts);
+    println!("Expires: {:?}", kv.expire_ts);
+}
+```
+
+## Scanning Ranges
+
+### Unbounded Range Scan
+
+Iterate over all keys in the database:
+
+```rust
+let mut iter = db.scan::<Vec<u8>, _>(..).await?;
+while let Some(kv) = iter.next().await? {
+    println!("{}: {}", 
+        String::from_utf8_lossy(&kv.key),
+        String::from_utf8_lossy(&kv.value)
+    );
+}
+```
+
+### Bounded Range Scan
+
+Scan a specific range of keys:
+
+```rust
+// Scan from "key1" to "key5" (exclusive end)
+let mut iter = db.scan(b"key1".to_vec()..b"key5".to_vec()).await?;
+while let Some(kv) = iter.next().await? {
+    println!("Found: {:?}", kv.key);
+}
+
+// Scan with inclusive end
+let mut iter = db.scan(b"a".to_vec()..=b"z".to_vec()).await?;
+```
+
+### Prefix Scan
+
+Scan all keys with a common prefix:
+
+```rust
+// Find all keys starting with "user:"
+let mut iter = db.scan_prefix(b"user:").await?;
+while let Some(kv) = iter.next().await? {
+    println!("User key: {:?}", kv.key);
+}
+```
+
+### Seeking in Iterators
+
+You can seek to a specific position within an iterator:
+
+```rust
+let mut iter = db.scan::<Vec<u8>, _>(..).await?;
+
+// Skip to "key_100"
+iter.seek(b"key_100").await?;
+
+if let Some(kv) = iter.next().await? {
+    // This will be key_100 or the next key after it
+    println!("Found: {:?}", kv.key);
+}
+```
+
+## Complete Example
+
+Here's a complete example demonstrating all basic operations:
+
+```rust
+use slatedb::{object_store::memory::InMemory, Db, Error};
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> Result<(), Error> {
+    // Setup
+    let object_store = Arc::new(InMemory::new());
+    let db = Db::open("/tmp/slatedb_example", object_store).await?;
+
+    // Write some data
+    db.put(b"user:1", b"alice").await?;
+    db.put(b"user:2", b"bob").await?;
+    db.put(b"user:3", b"charlie").await?;
+    db.put(b"config:timeout", b"30").await?;
+
+    // Read specific key
+    if let Some(value) = db.get(b"user:1").await? {
+        println!("User 1: {}", String::from_utf8_lossy(&value));
+    }
+
+    // Scan users
+    println!("\nAll users:");
+    let mut iter = db.scan_prefix(b"user:").await?;
+    while let Some(kv) = iter.next().await? {
+        println!("  {}: {}",
+            String::from_utf8_lossy(&kv.key),
+            String::from_utf8_lossy(&kv.value)
+        );
+    }
+
+    // Delete a user
+    db.delete(b"user:2").await?;
+
+    // Verify deletion
+    assert!(db.get(b"user:2").await?.is_none());
+
+    // Close the database
+    db.close().await?;
+
+    Ok(())
+}
+```
+
+## Best Practices
+
+<Tip>
+**Use appropriate key naming conventions**: Consider using prefixes for logical grouping (e.g., `user:`, `config:`, `session:`).
+</Tip>
+
+<Tip>
+**Handle the Bytes lifetime carefully**: The `Bytes` object returned by `get()` references a 4 KiB block. Copy the data if you need to retain it long-term.
+</Tip>
+
+<Warning>
+**Always close the database**: Call `db.close().await?` before your application exits to ensure data durability.
+</Warning>
+
+## Next Steps
+
+- Learn about [Batch Writes](/guides/basic-operations) for atomic multi-key operations
+- Explore [Transactions](/guides/transactions) for ACID guarantees
+- Understand [Snapshots](/guides/snapshots) for point-in-time reads

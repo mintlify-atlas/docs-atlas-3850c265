@@ -1,0 +1,414 @@
+---
+title: Checkpoints
+description: Create durable, detached snapshots of your SlateDB database
+---
+
+Checkpoints provide durable, point-in-time snapshots of your database that persist beyond the lifetime of a database instance. Unlike in-memory snapshots, checkpoints are stored in object storage and can be used for backups, recovery, and creating read-only database replicas.
+
+## Understanding Checkpoints
+
+A checkpoint is a named reference to a specific manifest version in object storage. It allows you to:
+- Create durable backups that survive database restarts
+- Open read-only database instances from a specific point in time
+- Implement time-travel queries
+- Create test environments from production data
+
+<Warning>
+Checkpoints require the database to be closed or use the Admin API. They capture the state of flushed data only.
+</Warning>
+
+## Creating Checkpoints
+
+### Using the Admin API
+
+The recommended way to create checkpoints is using the Admin API, which can create checkpoints on closed databases:
+
+```rust
+use slatedb::admin::AdminBuilder;
+use slatedb::config::CheckpointOptions;
+use slatedb::object_store::memory::InMemory;
+use slatedb::Db;
+use std::sync::Arc;
+use std::time::Duration;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let path = "/tmp/slatedb-checkpoint";
+    let object_store = Arc::new(InMemory::new());
+    
+    // Create and populate database
+    let db = Db::open(path, object_store.clone()).await?;
+    db.put(b"key1", b"value1").await?;
+    db.put(b"key2", b"value2").await?;
+    db.close().await?;
+
+    // Create checkpoint using Admin API
+    let admin = AdminBuilder::new(path, object_store).build();
+    
+    let result = admin
+        .create_detached_checkpoint(&CheckpointOptions {
+            lifetime: Some(Duration::from_secs(3600)), // expires in 1 hour
+            ..Default::default()
+        })
+        .await?;
+
+    println!(
+        "Created checkpoint: ID = {}, Manifest = {}",
+        result.id, result.manifest_id
+    );
+
+    Ok(())
+}
+```
+
+### Using the Database API
+
+You can also create checkpoints directly from an open database:
+
+```rust
+use slatedb::{Db, Error};
+use slatedb::config::{CheckpointScope, CheckpointOptions};
+use slatedb::object_store::memory::InMemory;
+use std::sync::Arc;
+use std::time::Duration;
+
+#[tokio::main]
+async fn main() -> Result<(), Error> {
+    let object_store = Arc::new(InMemory::new());
+    let db = Db::open("my_db", object_store).await?;
+
+    // Write some data
+    db.put(b"key1", b"value1").await?;
+    db.put(b"key2", b"value2").await?;
+
+    // Create checkpoint
+    let result = db.create_checkpoint(
+        CheckpointScope::All,
+        &CheckpointOptions {
+            lifetime: Some(Duration::from_secs(86400)), // 24 hours
+            ..Default::default()
+        },
+    ).await?;
+
+    println!("Checkpoint created: {}", result.id);
+
+    db.close().await?;
+    Ok(())
+}
+```
+
+## Checkpoint Options
+
+### Checkpoint Lifetime
+
+Control how long a checkpoint persists:
+
+```rust
+use slatedb::config::CheckpointOptions;
+use std::time::Duration;
+
+// Checkpoint expires after 1 hour
+let short_lived = CheckpointOptions {
+    lifetime: Some(Duration::from_secs(3600)),
+    ..Default::default()
+};
+
+// Checkpoint never expires
+let permanent = CheckpointOptions {
+    lifetime: None,
+    ..Default::default()
+};
+```
+
+<Tip>
+Set appropriate lifetimes to avoid accumulating old checkpoints. Use permanent checkpoints sparingly for critical backups.
+</Tip>
+
+### Checkpoint Scope
+
+When creating checkpoints from an open database, specify the scope:
+
+```rust
+use slatedb::config::CheckpointScope;
+
+// Flush all data before checkpoint (includes WAL and memtable)
+db.create_checkpoint(CheckpointScope::All, &options).await?;
+
+// Create checkpoint of current flushed state only
+db.create_checkpoint(CheckpointScope::Flushed, &options).await?;
+```
+
+<Steps>
+
+<Step title="CheckpointScope::All">
+Flushes all in-memory data (WAL and memtable) to object storage before creating the checkpoint. This ensures the checkpoint includes all written data.
+
+```rust
+let result = db.create_checkpoint(
+    CheckpointScope::All,
+    &CheckpointOptions::default(),
+).await?;
+```
+</Step>
+
+<Step title="CheckpointScope::Flushed">
+Creates a checkpoint of only the data already flushed to object storage. Faster but may not include recent writes.
+
+```rust
+let result = db.create_checkpoint(
+    CheckpointScope::Flushed,
+    &CheckpointOptions::default(),
+).await?;
+```
+</Step>
+
+</Steps>
+
+## Managing Checkpoints
+
+### Listing Checkpoints
+
+Retrieve all checkpoints for a database:
+
+```rust
+use slatedb::admin::AdminBuilder;
+
+let admin = AdminBuilder::new(path, object_store).build();
+let checkpoints = admin.list_checkpoints().await?;
+
+for checkpoint in checkpoints {
+    println!("Checkpoint ID: {}", checkpoint.id);
+    println!("  Manifest: {}", checkpoint.manifest_id);
+    println!("  Created: {}", checkpoint.create_time);
+    println!("  Expires: {:?}", checkpoint.expire_time);
+    println!("  Name: {:?}", checkpoint.name);
+}
+```
+
+### Deleting Checkpoints
+
+Remove checkpoints that are no longer needed:
+
+```rust
+use slatedb::admin::AdminBuilder;
+
+let admin = AdminBuilder::new(path, object_store).build();
+
+// Delete specific checkpoint
+admin.delete_checkpoint(checkpoint_id).await?;
+```
+
+### Refreshing Checkpoint Lifetime
+
+Extend the lifetime of an existing checkpoint:
+
+```rust
+use slatedb::admin::AdminBuilder;
+use std::time::Duration;
+
+let admin = AdminBuilder::new(path, object_store).build();
+
+// Extend checkpoint lifetime by 24 hours
+admin.refresh_checkpoint(
+    checkpoint_id,
+    Some(Duration::from_secs(86400)),
+).await?;
+```
+
+## Opening from Checkpoints
+
+### Read-Only Access
+
+Open a database in read-only mode from a checkpoint:
+
+```rust
+use slatedb::db::DbReaderBuilder;
+use slatedb::object_store::memory::InMemory;
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let object_store = Arc::new(InMemory::new());
+    let path = "/tmp/slatedb";
+    
+    // Open read-only from checkpoint
+    let reader = DbReaderBuilder::new(path, object_store)
+        .with_checkpoint(checkpoint_id)
+        .build()
+        .await?;
+
+    // Read data from the checkpoint
+    if let Some(value) = reader.get(b"key1").await? {
+        println!("Value: {:?}", value);
+    }
+
+    // Can scan ranges
+    let mut iter = reader.scan::<Vec<u8>, _>(..).await?;
+    while let Some(kv) = iter.next().await? {
+        println!("{:?}: {:?}", kv.key, kv.value);
+    }
+
+    Ok(())
+}
+```
+
+<Warning>
+Databases opened from checkpoints are read-only. Write operations will fail.
+</Warning>
+
+## Practical Use Cases
+
+### Scheduled Backups
+
+```rust
+use slatedb::admin::AdminBuilder;
+use slatedb::config::CheckpointOptions;
+use tokio::time::{interval, Duration};
+
+async fn run_backup_scheduler(
+    path: &str,
+    object_store: Arc<dyn ObjectStore>,
+) -> anyhow::Result<()> {
+    let admin = AdminBuilder::new(path, object_store).build();
+    let mut ticker = interval(Duration::from_secs(3600)); // Every hour
+
+    loop {
+        ticker.tick().await;
+        
+        // Create daily checkpoint
+        let result = admin
+            .create_detached_checkpoint(&CheckpointOptions {
+                lifetime: Some(Duration::from_secs(86400 * 7)), // Keep for 7 days
+                ..Default::default()
+            })
+            .await?;
+
+        println!("Backup created: {}", result.id);
+        
+        // Clean up old checkpoints
+        cleanup_old_checkpoints(&admin).await?;
+    }
+}
+
+async fn cleanup_old_checkpoints(admin: &Admin) -> anyhow::Result<()> {
+    let checkpoints = admin.list_checkpoints().await?;
+    
+    for checkpoint in checkpoints {
+        if let Some(expire_time) = checkpoint.expire_time {
+            if expire_time < chrono::Utc::now() {
+                admin.delete_checkpoint(checkpoint.id).await?;
+                println!("Deleted expired checkpoint: {}", checkpoint.id);
+            }
+        }
+    }
+    
+    Ok(())
+}
+```
+
+### Point-in-Time Recovery
+
+```rust
+use slatedb::db::DbReaderBuilder;
+
+async fn recover_to_checkpoint(
+    path: &str,
+    object_store: Arc<dyn ObjectStore>,
+    checkpoint_id: uuid::Uuid,
+) -> anyhow::Result<()> {
+    // Open from checkpoint
+    let reader = DbReaderBuilder::new(path, object_store.clone())
+        .with_checkpoint(checkpoint_id)
+        .build()
+        .await?;
+
+    // Export all data
+    let mut recovered_data = Vec::new();
+    let mut iter = reader.scan::<Vec<u8>, _>(..).await?;
+    while let Some(kv) = iter.next().await? {
+        recovered_data.push((kv.key.to_vec(), kv.value.to_vec()));
+    }
+
+    // Write to new database
+    let new_db = Db::open("/tmp/recovered_db", object_store).await?;
+    for (key, value) in recovered_data {
+        new_db.put(&key, &value).await?;
+    }
+    new_db.close().await?;
+
+    println!("Recovery complete");
+    Ok(())
+}
+```
+
+### Test Data Snapshots
+
+```rust
+async fn create_test_snapshot(
+    prod_path: &str,
+    object_store: Arc<dyn ObjectStore>,
+) -> anyhow::Result<uuid::Uuid> {
+    let admin = AdminBuilder::new(prod_path, object_store).build();
+    
+    // Create checkpoint of production data
+    let result = admin
+        .create_detached_checkpoint(&CheckpointOptions {
+            lifetime: Some(Duration::from_secs(3600)), // 1 hour
+            ..Default::default()
+        })
+        .await?;
+
+    Ok(result.id)
+}
+
+async fn run_tests_on_snapshot(
+    path: &str,
+    object_store: Arc<dyn ObjectStore>,
+    checkpoint_id: uuid::Uuid,
+) -> anyhow::Result<()> {
+    // Open test database from checkpoint
+    let test_reader = DbReaderBuilder::new(path, object_store)
+        .with_checkpoint(checkpoint_id)
+        .build()
+        .await?;
+
+    // Run tests against snapshot
+    assert!(test_reader.get(b"critical_key").await?.is_some());
+    
+    Ok(())
+}
+```
+
+## Best Practices
+
+<Tip>
+**Use CheckpointScope::All for backups**: Ensure all data is included by flushing before checkpoint creation.
+</Tip>
+
+<Tip>
+**Set appropriate lifetimes**: Balance storage costs with recovery needs. Daily backups might keep 7-30 days.
+</Tip>
+
+<Tip>
+**Automate cleanup**: Implement processes to delete expired checkpoints and prevent storage bloat.
+</Tip>
+
+<Warning>
+**Checkpoint creation is not instantaneous**: For large databases, flushing and checkpoint creation can take time.
+</Warning>
+
+## Checkpoints vs Snapshots
+
+| Feature | Checkpoint | Snapshot |
+|---------|------------|----------|
+| **Durability** | Persistent in object storage | In-memory only |
+| **Lifetime** | Survives DB restart | Lost on DB close |
+| **Creation** | Requires flush | Instant |
+| **Use case** | Backups, recovery | Consistent reads |
+| **Overhead** | Higher (I/O) | Lower (memory) |
+
+## Next Steps
+
+- Learn about [Snapshots](/guides/snapshots) for in-memory point-in-time reads
+- Explore [Change Data Capture](/guides/change-data-capture) for streaming changes
+- Understand [Basic Operations](/guides/basic-operations) for database fundamentals

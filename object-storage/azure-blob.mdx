@@ -1,0 +1,522 @@
+---
+title: Azure Blob Storage Configuration
+description: Configure SlateDB with Microsoft Azure Blob Storage
+---
+
+Microsoft Azure Blob Storage provides a scalable and secure object storage solution for SlateDB deployments on Azure.
+
+## Prerequisites
+
+- An Azure account
+- A storage account created in your desired region
+- A blob container for SlateDB data
+- Access credentials (account key, SAS token, or managed identity)
+
+```toml Cargo.toml
+[dependencies]
+slatedb = { version = "*", features = ["azure"] }
+object_store = { version = "*", features = ["azure"] }
+```
+
+## Authentication Methods
+
+SlateDB supports multiple ways to authenticate with Azure Blob Storage:
+
+<CodeGroup>
+
+```rust Account Key
+use object_store::azure::MicrosoftAzureBuilder;
+use slatedb::Db;
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    // Authenticate using storage account key
+    let blob_store = Arc::new(
+        MicrosoftAzureBuilder::new()
+            .with_account("mystorageaccount")
+            .with_access_key("your-access-key")
+            .with_container_name("slatedb-container")
+            .build()?
+    );
+
+    let db = Db::open("/tmp/slatedb_azure", blob_store).await?;
+    
+    db.put(b"key", b"value").await?;
+    db.close().await?;
+    
+    Ok(())
+}
+```
+
+```rust SAS Token
+use object_store::azure::MicrosoftAzureBuilder;
+use slatedb::Db;
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    // Authenticate using SAS token
+    let blob_store = Arc::new(
+        MicrosoftAzureBuilder::new()
+            .with_account("mystorageaccount")
+            .with_sas_token("your-sas-token")
+            .with_container_name("slatedb-container")
+            .build()?
+    );
+
+    let db = Db::open("/tmp/slatedb_azure", blob_store).await?;
+    
+    db.put(b"key", b"value").await?;
+    db.close().await?;
+    
+    Ok(())
+}
+```
+
+```rust Managed Identity
+use object_store::azure::MicrosoftAzureBuilder;
+use slatedb::Db;
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    // Use Managed Identity (for Azure VMs, AKS, etc.)
+    let blob_store = Arc::new(
+        MicrosoftAzureBuilder::new()
+            .with_account("mystorageaccount")
+            .with_container_name("slatedb-container")
+            .with_use_azure_cli(false)  // Use managed identity
+            .build()?
+    );
+
+    let db = Db::open("/tmp/slatedb_azure", blob_store).await?;
+    
+    db.put(b"key", b"value").await?;
+    db.close().await?;
+    
+    Ok(())
+}
+```
+
+```rust Connection String
+use object_store::azure::MicrosoftAzureBuilder;
+use slatedb::Db;
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    // Authenticate using connection string
+    let connection_string = "DefaultEndpointsProtocol=https;AccountName=mystorageaccount;AccountKey=...";
+    
+    let blob_store = Arc::new(
+        MicrosoftAzureBuilder::new()
+            .with_connection_string(connection_string)
+            .with_container_name("slatedb-container")
+            .build()?
+    );
+
+    let db = Db::open("/tmp/slatedb_azure", blob_store).await?;
+    
+    db.put(b"key", b"value").await?;
+    db.close().await?;
+    
+    Ok(())
+}
+```
+
+</CodeGroup>
+
+<Warning>
+  Never hardcode credentials in your source code. Use environment variables, managed identities, or Azure Key Vault in production.
+</Warning>
+
+## Environment Variables
+
+Configure Azure Blob Storage using environment variables:
+
+| Variable | Description | Required |
+|----------|-------------|----------|
+| `AZURE_STORAGE_ACCOUNT_NAME` | Storage account name | Yes |
+| `AZURE_STORAGE_CONTAINER_NAME` | Container name | Yes |
+| `AZURE_STORAGE_ACCESS_KEY` | Account access key | Yes* |
+| `AZURE_STORAGE_SAS_TOKEN` | SAS token | Yes* |
+| `AZURE_STORAGE_CONNECTION_STRING` | Full connection string | Yes* |
+| `AZURE_STORAGE_USE_EMULATOR` | Use Azurite emulator (true/false) | No |
+
+\* Provide one of: access key, SAS token, connection string, or use managed identity
+
+### Example Configuration
+
+```bash .env
+AZURE_STORAGE_ACCOUNT_NAME=mystorageaccount
+AZURE_STORAGE_ACCESS_KEY=your-access-key-here
+AZURE_STORAGE_CONTAINER_NAME=slatedb-container
+```
+
+## Complete Example
+
+Here's a complete example from the SlateDB examples directory:
+
+```rust examples/src/azure_blob_storage.rs
+use object_store::azure::MicrosoftAzureBuilder;
+use slatedb::{config::PutOptions, Db};
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    // Construct Azure Blob object store
+    let blob_store = Arc::new(
+        MicrosoftAzureBuilder::new()
+            .with_account("<REPLACEWITHACCOUNTNAME>")
+            .with_access_key("<REPLACEWITHACCOUNTKEY>")
+            .with_container_name("<REPLACEWITHCONTAINERNAME>")
+            .build()?
+    );
+
+    println!("Opening the db");
+    let path = "/tmp/slatedb_azure_blob_storage";
+    let db = Db::open(path, blob_store.clone()).await?;
+
+    // Put a value and wait for the flush
+    println!("Writing a value and waiting for flush");
+    db.put(b"k1", b"value1").await?;
+    println!("{:?}", db.get(b"k1").await?);
+
+    // Put 1000 keys, do not wait for it to be durable
+    println!("Writing 1000 keys without waiting for flush");
+    let write_options = slatedb::config::WriteOptions {
+        await_durable: false,
+    };
+    for i in 0..1000 {
+        db.put_with_options(
+            format!("key{}", i).as_bytes(),
+            format!("value{}", i).as_bytes(),
+            &PutOptions::default(),
+            &write_options,
+        )
+        .await?;
+    }
+
+    // Flush to make the writes durable
+    println!("Flushing the writes and closing the db");
+    db.flush().await?;
+    db.close().await?;
+
+    // Reopen the db and read the value
+    println!("Reopening the db");
+    let db_reopened = Db::open(path, blob_store).await?;
+    println!("Reading the value from the reopened db");
+
+    // Read 20 keys
+    for i in 0..20 {
+        println!(
+            "{:?}",
+            db_reopened.get(format!("key{}", i).as_bytes()).await
+        );
+    }
+    db_reopened.close().await?;
+
+    Ok(())
+}
+```
+
+## Creating Azure Resources
+
+### Using Azure CLI
+
+```bash
+# Create a resource group
+az group create --name slatedb-rg --location eastus
+
+# Create a storage account
+az storage account create \
+    --name slatestorageacct \
+    --resource-group slatedb-rg \
+    --location eastus \
+    --sku Standard_LRS \
+    --kind StorageV2
+
+# Create a container
+az storage container create \
+    --name slatedb-container \
+    --account-name slatestorageacct
+
+# Get the account key
+az storage account keys list \
+    --resource-group slatedb-rg \
+    --account-name slatestorageacct \
+    --query '[0].value' \
+    --output tsv
+```
+
+## Configuration Options
+
+### Storage Tier
+
+For SlateDB, use Hot tier for optimal performance:
+
+```bash
+az storage account create \
+    --name slatestorageacct \
+    --access-tier Hot
+```
+
+### Custom Endpoint
+
+Useful for Azure Stack or private endpoints:
+
+```rust
+let blob_store = MicrosoftAzureBuilder::new()
+    .with_account("mystorageaccount")
+    .with_access_key("your-key")
+    .with_container_name("slatedb-container")
+    .with_endpoint("https://mystorageaccount.privatelink.blob.core.windows.net")
+    .build()?;
+```
+
+### Retry Configuration
+
+Configure retry behavior for transient failures:
+
+```rust
+use object_store::RetryConfig;
+
+let retry_config = RetryConfig {
+    max_retries: 5,
+    retry_timeout: std::time::Duration::from_secs(60),
+    ..Default::default()
+};
+
+let blob_store = MicrosoftAzureBuilder::new()
+    .with_account("mystorageaccount")
+    .with_access_key("your-key")
+    .with_container_name("slatedb-container")
+    .with_retry(retry_config)
+    .build()?;
+```
+
+## Using with Azure Kubernetes Service (AKS)
+
+### Configure Managed Identity
+
+```bash
+# Create a managed identity
+az identity create \
+    --name slatedb-identity \
+    --resource-group slatedb-rg
+
+# Get the identity client ID
+IDENTITY_CLIENT_ID=$(az identity show \
+    --name slatedb-identity \
+    --resource-group slatedb-rg \
+    --query clientId \
+    --output tsv)
+
+# Grant storage access
+STORAGE_ID=$(az storage account show \
+    --name slatestorageacct \
+    --query id \
+    --output tsv)
+
+az role assignment create \
+    --assignee $IDENTITY_CLIENT_ID \
+    --role "Storage Blob Data Contributor" \
+    --scope $STORAGE_ID
+```
+
+### Application Code
+
+```rust
+// No explicit credentials needed - Managed Identity handles it
+let blob_store = Arc::new(
+    MicrosoftAzureBuilder::new()
+        .with_account("slatestorageacct")
+        .with_container_name("slatedb-container")
+        .build()?
+);
+```
+
+## Local Development with Azurite
+
+Azurite is the Azure Storage emulator for local development:
+
+### Start Azurite
+
+```bash
+# Using Docker
+docker run -p 10000:10000 mcr.microsoft.com/azure-storage/azurite \
+    azurite-blob --blobHost 0.0.0.0
+
+# Or using npm
+npm install -g azurite
+azurite --silent --location /tmp/azurite
+```
+
+### Configure for Azurite
+
+```rust
+let blob_store = Arc::new(
+    MicrosoftAzureBuilder::new()
+        .with_account("devstoreaccount1")
+        .with_access_key("Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==")
+        .with_container_name("slatedb-container")
+        .with_endpoint("http://127.0.0.1:10000/devstoreaccount1")
+        .with_allow_http(true)
+        .build()?
+);
+```
+
+<Warning>
+  The access key shown above is the well-known Azurite development key. Never use it in production.
+</Warning>
+
+## Security Best Practices
+
+### Use SAS Tokens with Limited Scope
+
+Generate SAS tokens with minimal permissions:
+
+```bash
+# Generate a SAS token with specific permissions and expiry
+az storage container generate-sas \
+    --account-name slatestorageacct \
+    --name slatedb-container \
+    --permissions racwdl \
+    --expiry 2026-12-31 \
+    --output tsv
+```
+
+### Enable Soft Delete
+
+Protect against accidental deletions:
+
+```bash
+az storage blob service-properties delete-policy update \
+    --account-name slatestorageacct \
+    --enable true \
+    --days-retained 7
+```
+
+### Configure Firewall Rules
+
+Restrict access to specific networks:
+
+```bash
+az storage account update \
+    --name slatestorageacct \
+    --resource-group slatedb-rg \
+    --default-action Deny
+
+az storage account network-rule add \
+    --account-name slatestorageacct \
+    --resource-group slatedb-rg \
+    --ip-address 203.0.113.0/24
+```
+
+### Enable Encryption at Rest
+
+Azure Storage encrypts data by default, but you can use customer-managed keys:
+
+```bash
+# Create a Key Vault
+az keyvault create \
+    --name slatedb-keyvault \
+    --resource-group slatedb-rg
+
+# Create an encryption key
+az keyvault key create \
+    --vault-name slatedb-keyvault \
+    --name slatedb-key \
+    --protection software
+
+# Configure the storage account to use the key
+az storage account update \
+    --name slatestorageacct \
+    --resource-group slatedb-rg \
+    --encryption-key-source Microsoft.Keyvault \
+    --encryption-key-vault https://slatedb-keyvault.vault.azure.net \
+    --encryption-key-name slatedb-key
+```
+
+## Performance Considerations
+
+### Choose the Right Region
+
+Create your storage account in the same region as your compute:
+
+```bash
+az account list-locations --query "[].name" --output tsv
+```
+
+### Use Premium Block Blobs
+
+For high-performance scenarios:
+
+```bash
+az storage account create \
+    --name slatepremiumacct \
+    --resource-group slatedb-rg \
+    --sku Premium_LRS \
+    --kind BlockBlobStorage
+```
+
+### Monitor Performance Metrics
+
+```bash
+az monitor metrics list \
+    --resource $STORAGE_ID \
+    --metric Transactions \
+    --aggregation Total
+```
+
+## Troubleshooting
+
+### Connection String Issues
+
+Get your connection string:
+
+```bash
+az storage account show-connection-string \
+    --name slatestorageacct \
+    --resource-group slatedb-rg
+```
+
+### Access Denied Errors
+
+Verify your credentials and permissions:
+
+```bash
+# Test with Azure CLI
+az storage blob list \
+    --account-name slatestorageacct \
+    --container-name slatedb-container
+```
+
+### Network Connectivity
+
+Check if the storage endpoint is reachable:
+
+```bash
+curl -I https://slatestorageacct.blob.core.windows.net
+```
+
+## Monitoring and Diagnostics
+
+### Enable Diagnostic Logging
+
+```bash
+az monitor diagnostic-settings create \
+    --name slatedb-logs \
+    --resource $STORAGE_ID \
+    --logs '[{"category":"StorageRead","enabled":true},{"category":"StorageWrite","enabled":true}]' \
+    --metrics '[{"category":"Transaction","enabled":true}]' \
+    --workspace /subscriptions/.../resourceGroups/.../providers/Microsoft.OperationalInsights/workspaces/...
+```
+
+## Next Steps
+
+- Learn about [database operations](/guides/basic-operations)
+- Configure [compaction settings](/configuration/compactor)
+- Set up [monitoring](/configuration/settings)
+- Explore [Azure Monitor integration](/configuration/settings)

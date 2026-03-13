@@ -1,0 +1,425 @@
+---
+title: 'Java'
+description: 'Use SlateDB in Java applications with Foreign Function & Memory API'
+---
+
+SlateDB provides official Java bindings built using Java's Foreign Function and Memory (FFM) API. The bindings call `slatedb-c` directly without a JNI wrapper layer.
+
+## Requirements
+
+- **Java 24** or higher (required for FFM API)
+- Rust toolchain (to build `slatedb-c`)
+- Supported object store (S3, GCS, Azure, MinIO, or local)
+
+## Installation
+
+### Maven
+
+Add the dependency to your `pom.xml`:
+
+```xml
+<dependency>
+  <groupId>io.slatedb</groupId>
+  <artifactId>slatedb</artifactId>
+  <version>${slatedb.version}</version>
+</dependency>
+```
+
+### Gradle
+
+Add the dependency to your `build.gradle`:
+
+```groovy
+implementation "io.slatedb:slatedb:${slatedbVersion}"
+```
+
+### Gradle Kotlin DSL
+
+For `build.gradle.kts`:
+
+```kotlin
+implementation("io.slatedb:slatedb:$slatedbVersion")
+```
+
+## Native Library
+
+The published JAR includes prebuilt native libraries for:
+
+- `linux-x86_64`
+- `linux-aarch64`
+- `macos-x86_64`
+- `macos-aarch64`
+- `windows-x86_64`
+- `windows-aarch64`
+
+The native library loads automatically from classpath resources—no need to set `java.library.path`.
+
+### Building Locally
+
+To build the JAR with native libraries:
+
+```bash
+./gradlew jar
+```
+
+The JAR is output to `slatedb-java/build/libs/slatedb-<version>.jar`.
+
+## Basic Usage
+
+```java
+import io.slatedb.SlateDb;
+import io.slatedb.SlateDbConfig;
+
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+
+public class Example {
+    public static void main(String[] args) throws Exception {
+        // Initialize logging
+        SlateDb.initLogging(SlateDbConfig.LogLevel.INFO);
+
+        // Create temporary directories
+        Path dbPath = Files.createTempDirectory("slatedb");
+        Path storePath = Files.createTempDirectory("slatedb-store");
+        String objectStoreUrl = "file://" + storePath.toAbsolutePath();
+
+        // Open database
+        try (SlateDb db = SlateDb.open(
+            dbPath.toString(),
+            objectStoreUrl,
+            null  // No env file
+        )) {
+            byte[] key = "hello".getBytes(StandardCharsets.UTF_8);
+            byte[] value = "world".getBytes(StandardCharsets.UTF_8);
+
+            // Put
+            db.put(key, value);
+
+            // Get
+            byte[] result = db.get(key);
+            System.out.println("Value: " + new String(result, StandardCharsets.UTF_8));
+
+            // Delete
+            db.delete(key);
+        }
+    }
+}
+```
+
+## Running Java Applications
+
+When running Java applications that use SlateDB, enable native access:
+
+```bash
+java --enable-native-access=ALL-UNNAMED \
+  -cp slatedb.jar:your-app.jar \
+  com.example.YourApp
+```
+
+Without this flag, you'll see warnings about restricted native access.
+
+## Object Store Configuration
+
+### In-Memory (Testing)
+
+```java
+String objectStoreUrl = "memory:///";
+SlateDb db = SlateDb.open(dbPath, objectStoreUrl, null);
+```
+
+### Local Filesystem
+
+```java
+String objectStoreUrl = "file:///tmp/slatedb-store";
+SlateDb db = SlateDb.open(dbPath, objectStoreUrl, null);
+```
+
+### AWS S3
+
+Create a `.env` file:
+
+```bash
+CLOUD_PROVIDER=aws
+AWS_BUCKET=my-bucket
+AWS_REGION=us-west-2
+AWS_ACCESS_KEY_ID=...
+AWS_SECRET_ACCESS_KEY=...
+```
+
+Then reference it:
+
+```java
+SlateDb db = SlateDb.open(dbPath, null, ".env");
+```
+
+Or use a direct URL:
+
+```java
+String objectStoreUrl = "s3://my-bucket";
+SlateDb db = SlateDb.open(dbPath, objectStoreUrl, null);
+```
+
+## Write Batches
+
+Batch multiple operations for atomic writes:
+
+```java
+import io.slatedb.SlateDb;
+import io.slatedb.SlateDbWriteBatch;
+
+try (SlateDb db = SlateDb.open(dbPath, objectStoreUrl, null)) {
+    try (SlateDbWriteBatch batch = SlateDb.newWriteBatch()) {
+        batch.put(
+            "key1".getBytes(StandardCharsets.UTF_8),
+            "value1".getBytes(StandardCharsets.UTF_8)
+        );
+        batch.put(
+            "key2".getBytes(StandardCharsets.UTF_8),
+            "value2".getBytes(StandardCharsets.UTF_8)
+        );
+        batch.delete("old-key".getBytes(StandardCharsets.UTF_8));
+
+        // Commit atomically
+        db.write(batch);
+    }
+}
+```
+
+## Range Scans
+
+Iterate over key ranges:
+
+```java
+import io.slatedb.SlateDbScanIterator;
+import io.slatedb.SlateDbKeyValue;
+
+try (SlateDb db = SlateDb.open(dbPath, objectStoreUrl, null)) {
+    // Put test data
+    db.put("user:1".getBytes(), "alice".getBytes());
+    db.put("user:2".getBytes(), "bob".getBytes());
+    db.put("user:3".getBytes(), "charlie".getBytes());
+
+    // Scan range
+    try (SlateDbScanIterator iter = db.scan(
+        "user:1".getBytes(StandardCharsets.UTF_8),
+        "user:3".getBytes(StandardCharsets.UTF_8)
+    )) {
+        SlateDbKeyValue kv;
+        while ((kv = iter.next()) != null) {
+            String key = new String(kv.key(), StandardCharsets.UTF_8);
+            String value = new String(kv.value(), StandardCharsets.UTF_8);
+            System.out.println(key + " = " + value);
+        }
+    }
+}
+```
+
+### Prefix Scans
+
+```java
+try (SlateDbScanIterator iter = db.scanPrefix(
+    "user:".getBytes(StandardCharsets.UTF_8)
+)) {
+    SlateDbKeyValue kv;
+    while ((kv = iter.next()) != null) {
+        System.out.println(new String(kv.key(), StandardCharsets.UTF_8));
+    }
+}
+```
+
+## Builder Pattern with Settings
+
+Use the builder for advanced configuration:
+
+```java
+import io.slatedb.SlateDb.Builder;
+import io.slatedb.SlateDbConfig.SstBlockSize;
+
+String settings = SlateDb.settingsDefault();
+
+try (Builder builder = SlateDb.builder(dbPath, objectStoreUrl, null)) {
+    builder.withSettingsJson(settings)
+           .withSstBlockSize(SstBlockSize.KIB_16);
+
+    try (SlateDb db = builder.build()) {
+        // Use database
+    }
+}
+```
+
+### Settings Helpers
+
+Load settings from various sources:
+
+```java
+// Get default settings JSON
+String settings = SlateDb.settingsDefault();
+
+// Load from file (.json, .toml, .yaml)
+String settings = SlateDb.settingsFromFile("config.toml");
+
+// Load from environment variables
+String settings = SlateDb.settingsFromEnv("SLATEDB");
+
+// Auto-detect from well-known locations
+String settings = SlateDb.settingsLoad();
+```
+
+## Merge Operator
+
+Define custom merge logic:
+
+```java
+import io.slatedb.SlateDbMergeOperator;
+
+public class CounterMerge implements SlateDbMergeOperator {
+    @Override
+    public byte[] merge(byte[] key, byte[] existing, byte[] operand) {
+        long existingValue = existing != null ? bytesToLong(existing) : 0;
+        long operandValue = bytesToLong(operand);
+        return longToBytes(existingValue + operandValue);
+    }
+
+    private long bytesToLong(byte[] bytes) {
+        // Implementation...
+    }
+
+    private byte[] longToBytes(long value) {
+        // Implementation...
+    }
+}
+
+// Use with builder
+try (Builder builder = SlateDb.builder(dbPath, objectStoreUrl, null)) {
+    builder.withMergeOperator(new CounterMerge());
+    try (SlateDb db = builder.build()) {
+        db.merge("counter".getBytes(), longToBytes(1));
+        db.merge("counter".getBytes(), longToBytes(5));
+        // Result: 6
+    }
+}
+```
+
+## Read-Only Access
+
+Use `SlateDbReader` for read-only workloads:
+
+```java
+import io.slatedb.SlateDbReader;
+import io.slatedb.SlateDbConfig.DbReaderOptions;
+
+DbReaderOptions options = new DbReaderOptions(
+    5000,   // manifestPollInterval (ms)
+    300000  // checkpointLifetime (ms)
+);
+
+try (SlateDbReader reader = SlateDb.openReader(
+    dbPath,
+    objectStoreUrl,
+    null,
+    options
+)) {
+    byte[] value = reader.get("key".getBytes(StandardCharsets.UTF_8));
+    // Process value...
+}
+```
+
+## API Reference
+
+### Core Database
+
+- `SlateDb.open(path, objectStoreUrl, envFile)` - Open database
+- `db.put(key, value)` - Put key-value pair
+- `db.get(key)` - Get value for key
+- `db.delete(key)` - Delete key
+- `db.merge(key, operand)` - Merge operand (requires merge operator)
+- `db.flush()` - Force flush to object storage
+- `db.close()` - Close database (or use try-with-resources)
+
+### Write Batches
+
+- `SlateDb.newWriteBatch()` - Create new batch
+- `batch.put(key, value)` - Add put operation
+- `batch.delete(key)` - Add delete operation
+- `batch.merge(key, operand)` - Add merge operation
+- `db.write(batch)` - Commit batch atomically
+
+### Iteration
+
+- `db.scan(startKey, endKey)` - Scan key range
+- `db.scanPrefix(prefix)` - Scan keys with prefix
+- `iterator.next()` - Get next key-value (returns null at end)
+- `iterator.close()` - Close iterator
+
+### Configuration
+
+- `SlateDb.builder(path, objectStoreUrl, envFile)` - Create builder
+- `builder.withSettingsJson(json)` - Set settings from JSON
+- `builder.withSstBlockSize(size)` - Set SST block size
+- `builder.withMergeOperator(operator)` - Set merge operator
+- `builder.build()` - Build and open database
+
+## Logging
+
+Initialize logging at application startup:
+
+```java
+import io.slatedb.SlateDb;
+import io.slatedb.SlateDbConfig.LogLevel;
+
+public class App {
+    public static void main(String[] args) throws Exception {
+        // Initialize once at startup
+        SlateDb.initLogging(LogLevel.INFO);
+
+        // Your application code...
+    }
+}
+```
+
+Available log levels:
+- `LogLevel.ERROR`
+- `LogLevel.WARN`
+- `LogLevel.INFO`
+- `LogLevel.DEBUG`
+- `LogLevel.TRACE`
+
+## Troubleshooting
+
+### UnsatisfiedLinkError
+
+If you see this error, the JAR doesn't contain a native library for your platform. Local builds only include the host platform. Use a Maven Central release artifact for multi-platform support.
+
+### Native Access Warnings
+
+Add `--enable-native-access=ALL-UNNAMED` to your Java command:
+
+```bash
+java --enable-native-access=ALL-UNNAMED -jar your-app.jar
+```
+
+## Testing
+
+Run tests with Gradle:
+
+```bash
+./gradlew test
+```
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Object Storage" icon="database" href="/object-storage/overview">
+    Configure S3, GCS, Azure, and more
+  </Card>
+  <Card title="Basic Operations" icon="code" href="/guides/basic-operations">
+    Learn core database operations
+  </Card>
+  <Card title="Merge Operator" icon="code-merge" href="/guides/merge-operator">
+    Implement custom merge logic
+  </Card>
+  <Card title="Configuration" icon="gear" href="/configuration/settings">
+    Tune performance and behavior
+  </Card>
+</CardGroup>

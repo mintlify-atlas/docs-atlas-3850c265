@@ -1,0 +1,908 @@
+---
+title: Db
+description: The main database interface for SlateDB
+---
+
+The `Db` struct represents a SlateDB database instance. It provides methods for reading and writing key-value data, managing transactions, and controlling database lifecycle.
+
+## Opening a Database
+
+### open()
+
+Open a new database with default options.
+
+```rust
+pub async fn open<P: Into<Path>>(
+    path: P,
+    object_store: Arc<dyn ObjectStore>,
+) -> Result<Db, Error>
+```
+
+<ParamField path="path" type="P: Into<Path>" required>
+  The path to the database
+</ParamField>
+
+<ParamField path="object_store" type="Arc<dyn ObjectStore>" required>
+  The object store to use for the database
+</ParamField>
+
+<ResponseField name="Result" type="Result<Db, Error>">
+  Returns the database instance on success, or an error if the database could not be opened
+</ResponseField>
+
+**Example:**
+
+```rust
+use slatedb::{Db, Error};
+use slatedb::object_store::memory::InMemory;
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> Result<(), Error> {
+    let object_store = Arc::new(InMemory::new());
+    let db = Db::open("test_db", object_store).await?;
+    Ok(())
+}
+```
+
+### builder()
+
+Creates a new builder for a database at the given path.
+
+```rust
+pub fn builder<P: Into<Path>>(
+    path: P,
+    object_store: Arc<dyn ObjectStore>
+) -> DbBuilder<P>
+```
+
+<ParamField path="path" type="P: Into<Path>" required>
+  The path to the database
+</ParamField>
+
+<ParamField path="object_store" type="Arc<dyn ObjectStore>" required>
+  The object store to use for the database
+</ParamField>
+
+<ResponseField name="DbBuilder" type="DbBuilder<P>">
+  Returns a builder to configure and initialize the database
+</ResponseField>
+
+**Example:**
+
+```rust
+use slatedb::{Db, Error};
+use slatedb::object_store::memory::InMemory;
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> Result<(), Error> {
+    let object_store = Arc::new(InMemory::new());
+    let db = Db::builder("/tmp/test_db", object_store)
+        .build()
+        .await?;
+    Ok(())
+}
+```
+
+## Read Operations
+
+### get()
+
+Get a value from the database with default read options.
+
+```rust
+pub async fn get<K: AsRef<[u8]> + Send>(
+    &self,
+    key: K
+) -> Result<Option<Bytes>, Error>
+```
+
+<ParamField path="key" type="K: AsRef<[u8]> + Send" required>
+  The key to get
+</ParamField>
+
+<ResponseField name="Result" type="Result<Option<Bytes>, Error>">
+  Returns `Some(Bytes)` if the key exists, `None` if it doesn't exist, or an error
+</ResponseField>
+
+<Note>
+The `Bytes` object returned contains a slice of an entire 4 KiB block. The block will be held in memory as long as the caller holds a reference to the `Bytes` object. Consider copying the data if you need to hold it for a long time.
+</Note>
+
+**Example:**
+
+```rust
+use slatedb::{Db, Error};
+use slatedb::object_store::{ObjectStore, memory::InMemory};
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> Result<(), Error> {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let db = Db::open("test_db", object_store).await?;
+    db.put(b"key", b"value").await?;
+    assert_eq!(db.get(b"key").await?, Some("value".into()));
+    Ok(())
+}
+```
+
+### get_with_options()
+
+Get a value from the database with custom read options.
+
+```rust
+pub async fn get_with_options<K: AsRef<[u8]> + Send>(
+    &self,
+    key: K,
+    options: &ReadOptions
+) -> Result<Option<Bytes>, Error>
+```
+
+<ParamField path="key" type="K: AsRef<[u8]> + Send" required>
+  The key to get
+</ParamField>
+
+<ParamField path="options" type="&ReadOptions" required>
+  The read options to use
+</ParamField>
+
+<ResponseField name="Result" type="Result<Option<Bytes>, Error>">
+  Returns `Some(Bytes)` if the key exists, `None` if it doesn't exist, or an error
+</ResponseField>
+
+**Example:**
+
+```rust
+use slatedb::{Db, config::ReadOptions, Error};
+use slatedb::object_store::{ObjectStore, memory::InMemory};
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> Result<(), Error> {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let db = Db::open("test_db", object_store).await?;
+    db.put(b"key", b"value").await?;
+    assert_eq!(db.get_with_options(b"key", &ReadOptions::default()).await?, Some("value".into()));
+    Ok(())
+}
+```
+
+### get_key_value()
+
+Get a key-value pair from the database with default read options.
+
+Returns the key along with its value and metadata (sequence number, creation timestamp, expiration timestamp). Unlike `get()`, which returns only the value bytes, this method returns a `KeyValue` that includes row metadata.
+
+```rust
+pub async fn get_key_value<K: AsRef<[u8]> + Send>(
+    &self,
+    key: K
+) -> Result<Option<KeyValue>, Error>
+```
+
+<ParamField path="key" type="K: AsRef<[u8]> + Send" required>
+  The key to look up
+</ParamField>
+
+<ResponseField name="Result" type="Result<Option<KeyValue>, Error>">
+  Returns `Some(KeyValue)` if the key exists and is not deleted/expired, `None` if it doesn't exist or is deleted/expired, or an error
+</ResponseField>
+
+### get_key_value_with_options()
+
+Get a key-value pair from the database with custom read options.
+
+```rust
+pub async fn get_key_value_with_options<K: AsRef<[u8]> + Send>(
+    &self,
+    key: K,
+    options: &ReadOptions
+) -> Result<Option<KeyValue>, Error>
+```
+
+<ParamField path="key" type="K: AsRef<[u8]> + Send" required>
+  The key to look up
+</ParamField>
+
+<ParamField path="options" type="&ReadOptions" required>
+  The read options to use
+</ParamField>
+
+<ResponseField name="Result" type="Result<Option<KeyValue>, Error>">
+  Returns `Some(KeyValue)` if the key exists and is not deleted/expired, `None` if it doesn't exist or is deleted/expired, or an error
+</ResponseField>
+
+### scan()
+
+Scan a range of keys using the default scan options.
+
+```rust
+pub async fn scan<K, T>(&self, range: T) -> Result<DbIterator, Error>
+where
+    K: AsRef<[u8]> + Send,
+    T: RangeBounds<K> + Send
+```
+
+<ParamField path="range" type="T: RangeBounds<K> + Send" required>
+  The range of keys to scan (e.g., `"a".."z"`, `..`, `"key"..`)
+</ParamField>
+
+<ResponseField name="Result" type="Result<DbIterator, Error>">
+  Returns an iterator with the results of the scan
+</ResponseField>
+
+**Example:**
+
+```rust
+use slatedb::{Db, Error};
+use slatedb::object_store::{ObjectStore, memory::InMemory};
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> Result<(), Error> {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let db = Db::open("test_db", object_store).await?;
+    db.put(b"a", b"a_value").await?;
+    db.put(b"b", b"b_value").await?;
+
+    let mut iter = db.scan("a".."b").await?;
+    let kv = iter.next().await?.unwrap();
+    assert_eq!(kv.key.as_ref(), b"a");
+    assert_eq!(kv.value.as_ref(), b"a_value");
+    assert_eq!(None, iter.next().await?);
+    Ok(())
+}
+```
+
+### scan_with_options()
+
+Scan a range of keys with the provided options.
+
+```rust
+pub async fn scan_with_options<K, T>(
+    &self,
+    range: T,
+    options: &ScanOptions
+) -> Result<DbIterator, Error>
+where
+    K: AsRef<[u8]> + Send,
+    T: RangeBounds<K> + Send
+```
+
+<ParamField path="range" type="T: RangeBounds<K> + Send" required>
+  The range of keys to scan
+</ParamField>
+
+<ParamField path="options" type="&ScanOptions" required>
+  The scan options to use
+</ParamField>
+
+<ResponseField name="Result" type="Result<DbIterator, Error>">
+  Returns an iterator with the results of the scan
+</ResponseField>
+
+### scan_prefix()
+
+Scan all keys that share the provided prefix using the default scan options.
+
+```rust
+pub async fn scan_prefix<P>(&self, prefix: P) -> Result<DbIterator, Error>
+where
+    P: AsRef<[u8]> + Send
+```
+
+<ParamField path="prefix" type="P: AsRef<[u8]> + Send" required>
+  The key prefix to scan
+</ParamField>
+
+<ResponseField name="Result" type="Result<DbIterator, Error>">
+  Returns an iterator with the results of the scan
+</ResponseField>
+
+**Example:**
+
+```rust
+use slatedb::{Db, Error};
+use slatedb::object_store::{ObjectStore, memory::InMemory};
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> Result<(), Error> {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let db = Db::open("test_db", object_store).await?;
+    db.put(b"ab", b"v0").await?;
+    db.put(b"aba", b"v1").await?;
+    db.put(b"b", b"v2").await?;
+
+    let mut iter = db.scan_prefix(b"ab").await?;
+    let kv = iter.next().await?.unwrap();
+    assert_eq!(kv.key.as_ref(), b"ab");
+    let kv = iter.next().await?.unwrap();
+    assert_eq!(kv.key.as_ref(), b"aba");
+    assert_eq!(None, iter.next().await?);
+    Ok(())
+}
+```
+
+### scan_prefix_with_options()
+
+Scan all keys that share the provided prefix with custom options.
+
+```rust
+pub async fn scan_prefix_with_options<P>(
+    &self,
+    prefix: P,
+    options: &ScanOptions
+) -> Result<DbIterator, Error>
+where
+    P: AsRef<[u8]> + Send
+```
+
+<ParamField path="prefix" type="P: AsRef<[u8]> + Send" required>
+  The key prefix to scan
+</ParamField>
+
+<ParamField path="options" type="&ScanOptions" required>
+  The scan options to use
+</ParamField>
+
+<ResponseField name="Result" type="Result<DbIterator, Error>">
+  Returns an iterator with the results of the scan
+</ResponseField>
+
+## Write Operations
+
+### put()
+
+Write a value into the database with default `WriteOptions`.
+
+```rust
+pub async fn put<K, V>(&self, key: K, value: V) -> Result<WriteHandle, Error>
+where
+    K: AsRef<[u8]>,
+    V: AsRef<[u8]>
+```
+
+<ParamField path="key" type="K: AsRef<[u8]>" required>
+  The key to write
+</ParamField>
+
+<ParamField path="value" type="V: AsRef<[u8]>" required>
+  The value to write
+</ParamField>
+
+<ResponseField name="Result" type="Result<WriteHandle, Error>">
+  Returns a write handle containing the sequence number and timestamp of the write operation
+</ResponseField>
+
+**Example:**
+
+```rust
+use slatedb::{Db, Error};
+use slatedb::object_store::{ObjectStore, memory::InMemory};
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> Result<(), Error> {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let db = Db::open("test_db", object_store).await?;
+    let handle = db.put(b"key", b"value").await?;
+    Ok(())
+}
+```
+
+### put_with_options()
+
+Write a value into the database with custom `PutOptions` and `WriteOptions`.
+
+```rust
+pub async fn put_with_options<K, V>(
+    &self,
+    key: K,
+    value: V,
+    put_opts: &PutOptions,
+    write_opts: &WriteOptions
+) -> Result<WriteHandle, Error>
+where
+    K: AsRef<[u8]>,
+    V: AsRef<[u8]>
+```
+
+<ParamField path="key" type="K: AsRef<[u8]>" required>
+  The key to write
+</ParamField>
+
+<ParamField path="value" type="V: AsRef<[u8]>" required>
+  The value to write
+</ParamField>
+
+<ParamField path="put_opts" type="&PutOptions" required>
+  The put options to use (e.g., TTL settings)
+</ParamField>
+
+<ParamField path="write_opts" type="&WriteOptions" required>
+  The write options to use (e.g., durability settings)
+</ParamField>
+
+<ResponseField name="Result" type="Result<WriteHandle, Error>">
+  Returns a write handle containing the sequence number and timestamp of the write operation
+</ResponseField>
+
+### delete()
+
+Delete a key from the database with default `WriteOptions`.
+
+```rust
+pub async fn delete<K: AsRef<[u8]>>(&self, key: K) -> Result<WriteHandle, Error>
+```
+
+<ParamField path="key" type="K: AsRef<[u8]>" required>
+  The key to delete
+</ParamField>
+
+<ResponseField name="Result" type="Result<WriteHandle, Error>">
+  Returns a write handle containing the sequence number and timestamp of the delete operation
+</ResponseField>
+
+**Example:**
+
+```rust
+use slatedb::{Db, Error};
+use slatedb::object_store::{ObjectStore, memory::InMemory};
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> Result<(), Error> {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let db = Db::open("test_db", object_store).await?;
+    let handle = db.delete(b"key").await?;
+    Ok(())
+}
+```
+
+### delete_with_options()
+
+Delete a key from the database with custom `WriteOptions`.
+
+```rust
+pub async fn delete_with_options<K: AsRef<[u8]>>(
+    &self,
+    key: K,
+    options: &WriteOptions
+) -> Result<WriteHandle, Error>
+```
+
+<ParamField path="key" type="K: AsRef<[u8]>" required>
+  The key to delete
+</ParamField>
+
+<ParamField path="options" type="&WriteOptions" required>
+  The write options to use
+</ParamField>
+
+<ResponseField name="Result" type="Result<WriteHandle, Error>">
+  Returns a write handle containing the sequence number and timestamp of the delete operation
+</ResponseField>
+
+### merge()
+
+Merge a value into the database with default `MergeOptions` and `WriteOptions`.
+
+Merge operations allow applications to bypass the traditional read/modify/write cycle by expressing partial updates using an associative operator. The merge operator must be configured when opening the database.
+
+```rust
+pub async fn merge<K, V>(&self, key: K, value: V) -> Result<WriteHandle, Error>
+where
+    K: AsRef<[u8]>,
+    V: AsRef<[u8]>
+```
+
+<ParamField path="key" type="K: AsRef<[u8]>" required>
+  The key to merge into
+</ParamField>
+
+<ParamField path="value" type="V: AsRef<[u8]>" required>
+  The merge operand to apply
+</ParamField>
+
+<ResponseField name="Result" type="Result<WriteHandle, Error>">
+  Returns a write handle containing the sequence number and timestamp of the merge operation, or an error if no merge operator is configured
+</ResponseField>
+
+**Example:**
+
+```rust
+use slatedb::{Db, Error, MergeOperator, MergeOperatorError};
+use slatedb::object_store::{ObjectStore, memory::InMemory};
+use std::sync::Arc;
+use bytes::Bytes;
+
+struct StringConcatMergeOperator;
+
+impl MergeOperator for StringConcatMergeOperator {
+    fn merge(&self, _key: &Bytes, existing_value: Option<Bytes>, value: Bytes) -> Result<Bytes, MergeOperatorError> {
+        let mut result = existing_value.unwrap_or_default().as_ref().to_vec();
+        result.extend_from_slice(&value);
+        Ok(Bytes::from(result))
+    }
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Error> {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let db = Db::builder("test_db", object_store)
+        .with_merge_operator(Arc::new(StringConcatMergeOperator))
+        .build()
+        .await?;
+    let handle = db.merge(b"key", b"value").await?;
+    Ok(())
+}
+```
+
+### merge_with_options()
+
+Merge a value into the database with custom `MergeOptions` and `WriteOptions`.
+
+```rust
+pub async fn merge_with_options<K, V>(
+    &self,
+    key: K,
+    value: V,
+    merge_opts: &MergeOptions,
+    write_opts: &WriteOptions
+) -> Result<WriteHandle, Error>
+where
+    K: AsRef<[u8]>,
+    V: AsRef<[u8]>
+```
+
+<ParamField path="key" type="K: AsRef<[u8]>" required>
+  The key to merge into
+</ParamField>
+
+<ParamField path="value" type="V: AsRef<[u8]>" required>
+  The merge operand to apply
+</ParamField>
+
+<ParamField path="merge_opts" type="&MergeOptions" required>
+  The merge options to use
+</ParamField>
+
+<ParamField path="write_opts" type="&WriteOptions" required>
+  The write options to use
+</ParamField>
+
+<ResponseField name="Result" type="Result<WriteHandle, Error>">
+  Returns a write handle containing the sequence number and timestamp of the merge operation, or an error if no merge operator is configured
+</ResponseField>
+
+### write()
+
+Write a batch of put/delete operations atomically to the database. Batch writes block other gets and writes until the batch is written to the WAL (or memtable if WAL is disabled).
+
+```rust
+pub async fn write(&self, batch: WriteBatch) -> Result<WriteHandle, Error>
+```
+
+<ParamField path="batch" type="WriteBatch" required>
+  The batch of put/delete operations to write
+</ParamField>
+
+<ResponseField name="Result" type="Result<WriteHandle, Error>">
+  Returns a write handle containing the sequence number and timestamp of the batch write operation
+</ResponseField>
+
+**Example:**
+
+```rust
+use slatedb::{WriteBatch, Db, Error};
+use slatedb::object_store::{ObjectStore, memory::InMemory};
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> Result<(), Error> {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let db = Db::open("test_db", object_store).await?;
+
+    let mut batch = WriteBatch::new();
+    batch.put(b"key1", b"value1");
+    batch.put(b"key2", b"value2");
+    batch.delete(b"key1");
+    let handle = db.write(batch).await?;
+
+    Ok(())
+}
+```
+
+### write_with_options()
+
+Write a batch of put/delete operations atomically to the database with custom write options.
+
+```rust
+pub async fn write_with_options(
+    &self,
+    batch: WriteBatch,
+    options: &WriteOptions
+) -> Result<WriteHandle, Error>
+```
+
+<ParamField path="batch" type="WriteBatch" required>
+  The batch of put/delete operations to write
+</ParamField>
+
+<ParamField path="options" type="&WriteOptions" required>
+  The write options to use
+</ParamField>
+
+<ResponseField name="Result" type="Result<WriteHandle, Error>">
+  Returns a write handle containing the sequence number and timestamp of the batch write operation
+</ResponseField>
+
+## Flush Operations
+
+### flush()
+
+Flush in-memory writes to disk. This function blocks until the in-memory data has been durably written to object storage.
+
+If WAL is enabled, this method is equivalent to:
+`flush_with_options(FlushOptions { flush_type: FlushType::Wal })`
+
+If WAL is disabled, this method is equivalent to:
+`flush_with_options(FlushOptions { flush_type: FlushType::Memtable })`
+
+```rust
+pub async fn flush(&self) -> Result<(), Error>
+```
+
+<ResponseField name="Result" type="Result<(), Error>">
+  Returns `Ok(())` if the flush was successful, or an error
+</ResponseField>
+
+**Example:**
+
+```rust
+use slatedb::{Db, Error};
+use slatedb::object_store::{ObjectStore, memory::InMemory};
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> Result<(), Error> {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let db = Db::open("test_db", object_store).await?;
+    db.flush().await?;
+    Ok(())
+}
+```
+
+### flush_with_options()
+
+Flush in-memory writes to disk with custom options.
+
+An error will be returned if `options.flush_type` is `FlushType::Wal` and the WAL is disabled.
+`FlushType::Memtable` is allowed even if WAL is enabled.
+
+```rust
+pub async fn flush_with_options(&self, options: FlushOptions) -> Result<(), Error>
+```
+
+<ParamField path="options" type="FlushOptions" required>
+  The flush options (e.g., `FlushType::Wal` or `FlushType::Memtable`)
+</ParamField>
+
+<ResponseField name="Result" type="Result<(), Error>">
+  Returns `Ok(())` if the flush was successful, or an error
+</ResponseField>
+
+**Example:**
+
+```rust
+use slatedb::{Db, Error};
+use slatedb::config::{FlushOptions, FlushType};
+use slatedb::object_store::{ObjectStore, memory::InMemory};
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> Result<(), Error> {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let db = Db::open("test_db", object_store).await?;
+    db.flush_with_options(FlushOptions {
+        flush_type: FlushType::Wal,
+    })
+    .await?;
+    Ok(())
+}
+```
+
+## Snapshot Operations
+
+### snapshot()
+
+Create a snapshot of the database. The snapshot represents a consistent view of the database at the time it is created.
+
+```rust
+pub async fn snapshot(&self) -> Result<Arc<DbSnapshot>, Error>
+```
+
+<ResponseField name="Result" type="Result<Arc<DbSnapshot>, Error>">
+  Returns a snapshot of the database, which provides read-only access to the database state at the time of creation
+</ResponseField>
+
+**Example:**
+
+```rust
+use slatedb::{Db, Error};
+use slatedb::object_store::{ObjectStore, memory::InMemory};
+use std::sync::Arc;
+use bytes::Bytes;
+
+#[tokio::main]
+async fn main() -> Result<(), Error> {
+    let object_store = Arc::new(InMemory::new());
+    let db = Db::open("test_db", object_store).await?;
+
+    // Write some data and create a snapshot
+    db.put(b"key1", b"value1").await?;
+    let snapshot = db.snapshot().await?;
+
+    // Snapshot provides read-only access to database state
+    let value = snapshot.get(b"key1").await?;
+    assert_eq!(value, Some(Bytes::from(b"value1".as_ref())));
+
+    // Write more data to original database
+    db.put(b"key2", b"value2").await?;
+
+    // Snapshot still sees old state, original db sees new data
+    assert_eq!(snapshot.get(b"key2").await?, None);
+    assert_eq!(db.get(b"key2").await?, Some(Bytes::from(b"value2".as_ref())));
+
+    Ok(())
+}
+```
+
+## Transaction Operations
+
+### begin()
+
+Begin a new transaction with the specified isolation level.
+
+```rust
+pub async fn begin(
+    &self,
+    isolation_level: IsolationLevel
+) -> Result<DbTransaction, Error>
+```
+
+<ParamField path="isolation_level" type="IsolationLevel" required>
+  The isolation level for the transaction
+</ParamField>
+
+<ResponseField name="Result" type="Result<DbTransaction, Error>">
+  Returns a transaction handle
+</ResponseField>
+
+**Example:**
+
+```rust
+use slatedb::{Db, IsolationLevel};
+use slatedb::object_store::memory::InMemory;
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> Result<(), slatedb::Error> {
+    let object_store = Arc::new(InMemory::new());
+    let db = Db::open("test_db", object_store).await?;
+    let txn = db.begin(IsolationLevel::SerializableSnapshot).await?;
+    Ok(())
+}
+```
+
+## Lifecycle Operations
+
+### close()
+
+Close the database.
+
+```rust
+pub async fn close(&self) -> Result<(), Error>
+```
+
+<ResponseField name="Result" type="Result<(), Error>">
+  Returns `Ok(())` if the database was closed successfully, or an error
+</ResponseField>
+
+**Example:**
+
+```rust
+use slatedb::{Db, Error};
+use slatedb::object_store::{ObjectStore, memory::InMemory};
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> Result<(), Error> {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let db = Db::open("test_db", object_store).await?;
+    db.close().await?;
+    Ok(())
+}
+```
+
+### status()
+
+Check the database status.
+
+This is a passive check that does not perform any I/O. The status is checked at least every `Settings::manifest_poll_interval`, but might also be updated based on other internal events or user-facing operations.
+
+Once a database is closed, either normally or due to an error, it can't be reopened. A new `Db` instance must be created to access the database again.
+
+```rust
+pub fn status(&self) -> Result<(), Error>
+```
+
+<ResponseField name="Result" type="Result<(), Error>">
+  - `Ok(())` if the DB is still open
+  - `Err(ErrorKind::Closed)` if the DB was closed normally
+  - `Err(e)` if the DB was closed with an error, where `e` is the error that caused the closure
+</ResponseField>
+
+## Utility Methods
+
+### manifest()
+
+Get the current manifest state.
+
+This returns the in-memory manifest snapshot currently held by the `Db`.
+
+```rust
+pub fn manifest(&self) -> ManifestCore
+```
+
+<ResponseField name="ManifestCore" type="ManifestCore">
+  Returns the current manifest state
+</ResponseField>
+
+### metrics()
+
+Get the metrics registry for the database.
+
+```rust
+pub fn metrics(&self) -> Arc<StatRegistry>
+```
+
+<ResponseField name="Arc<StatRegistry>" type="Arc<StatRegistry>">
+  Returns the metrics registry
+</ResponseField>
+
+### subscribe()
+
+Subscribe to database state changes.
+
+Returns a `tokio::sync::watch::Receiver<DbStatus>` that always reflects the latest database status. For example, you can wait for a specific sequence number to become durable.
+
+```rust
+pub fn subscribe(&self) -> tokio::sync::watch::Receiver<DbStatus>
+```
+
+<ResponseField name="Receiver" type="tokio::sync::watch::Receiver<DbStatus>">
+  Returns a receiver that can be used to watch database status changes
+</ResponseField>
+
+<Warning>
+**Deadlock risk:** The returned receiver holds a read lock on the current value while borrowed. The database must acquire a write lock to publish new status updates. Holding the read guard for an extended period will block all database status updates and may cause a deadlock. Always clone or copy the data you need.
+</Warning>
+
+### resolve_object_store()
+
+Resolve an object store from a URL.
+
+```rust
+pub fn resolve_object_store(url: &str) -> Result<Arc<dyn ObjectStore>, Error>
+```
+
+<ParamField path="url" type="&str" required>
+  The URL to resolve, for example `s3://my-bucket/my-prefix`
+</ParamField>
+
+<ResponseField name="Result" type="Result<Arc<dyn ObjectStore>, Error>">
+  Returns the resolved object store
+</ResponseField>

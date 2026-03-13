@@ -1,0 +1,289 @@
+---
+title: 'DbIterator'
+description: 'Iterate over key-value pairs in SlateDB'
+icon: 'arrows-rotate'
+---
+
+## Overview
+
+`DbIterator` provides an efficient way to iterate over key-value pairs in SlateDB. It supports both point lookups and range scans, automatically merging data from multiple sources (write batches, memtables, L0 SSTables, and compacted sorted runs).
+
+## Key Features
+
+- **Range-based iteration**: Scan key-value pairs within a specified range
+- **Point lookups**: Efficiently retrieve single keys
+- **Multi-source merging**: Automatically merges data from write batches, memtables, L0 SSTables, and sorted runs
+- **Tombstone filtering**: Automatically filters out deleted entries
+- **Forward-only seeking**: Supports efficient forward seeks within the iteration range
+- **Snapshot isolation**: Optionally filter by sequence number for consistent snapshots
+- **TTL support**: Automatically filters expired entries based on time-to-live
+
+## Creating an Iterator
+
+Iterators are typically created through the `Db::scan()` method:
+
+```rust
+use slatedb::{Db, config::ScanOptions};
+
+// Scan all keys
+let mut iter = db.scan(..).await?;
+
+// Scan a specific range
+let mut iter = db.scan(b"key1"..b"key9").await?;
+
+// Scan with options
+let options = ScanOptions::new()
+    .with_read_ahead_bytes(1024 * 1024); // 1MB read-ahead
+let mut iter = db.scan_with_options(.., options).await?;
+```
+
+## Iterating Over Results
+
+### Basic Iteration
+
+Use `next()` to retrieve key-value pairs one at a time:
+
+```rust
+let mut iter = db.scan(..).await?;
+
+while let Some(kv) = iter.next().await? {
+    println!("Key: {:?}, Value: {:?}", kv.key, kv.value);
+}
+```
+
+### Point Lookup Pattern
+
+For single-key lookups, the iterator optimizes by only checking necessary sources:
+
+```rust
+use bytes::Bytes;
+
+let key = Bytes::from("my_key");
+let mut iter = db.scan(key.clone()..=key).await?;
+
+if let Some(kv) = iter.next().await? {
+    println!("Found value: {:?}", kv.value);
+} else {
+    println!("Key not found");
+}
+```
+
+### Range Scan Pattern
+
+Scan a range of keys efficiently:
+
+```rust
+let mut iter = db.scan(b"user:1000"..b"user:2000").await?;
+let mut count = 0;
+
+while let Some(kv) = iter.next().await? {
+    // Process each key-value pair
+    count += 1;
+}
+
+println!("Found {} entries", count);
+```
+
+## Seeking
+
+The `seek()` method allows you to skip ahead to a specific key within the iteration range:
+
+```rust
+let mut iter = db.scan(b"key:000"..b"key:999").await?;
+
+// Skip to a specific key
+iter.seek(b"key:500").await?;
+
+// Continue iteration from the seek position
+while let Some(kv) = iter.next().await? {
+    println!("Key: {:?}", kv.key);
+}
+```
+
+### Seek Constraints
+
+<Warning>
+  The `seek()` method has important constraints:
+  - Can only seek **forward** (not backward)
+  - Seek key must be **within the original scan range**
+  - Seek key must be **greater than the last returned key**
+</Warning>
+
+```rust
+let mut iter = db.scan(b"key:000"..b"key:999").await?;
+
+// Get first key
+let first = iter.next().await?;
+
+// ❌ This will fail - cannot seek backward
+iter.seek(b"key:000").await.unwrap_err();
+
+// ✅ This works - seeking forward
+iter.seek(b"key:500").await?;
+
+// ❌ This will fail - outside scan range
+iter.seek(b"key:zzz").await.unwrap_err();
+```
+
+## Iterator Invalidation
+
+Iterators can become invalidated due to underlying errors (e.g., checksum mismatches, I/O errors). Once invalidated, all subsequent operations will return the same error:
+
+```rust
+let mut iter = db.scan(..).await?;
+
+match iter.next().await {
+    Ok(Some(kv)) => println!("Got: {:?}", kv),
+    Ok(None) => println!("End of iteration"),
+    Err(e) => {
+        eprintln!("Iterator error: {}", e);
+        // Iterator is now invalidated
+        // All future operations will return the same error
+    }
+}
+```
+
+## Snapshot Isolation
+
+Iterators can be created with a maximum sequence number to provide snapshot isolation:
+
+```rust
+// This is typically handled internally by transactions
+// but can be controlled for custom snapshot isolation
+let snapshot_seq = 100;
+
+// Iterator will only see entries with sequence numbers <= 100
+let mut iter = db.scan_with_snapshot(.., snapshot_seq).await?;
+```
+
+## TTL and Expiration
+
+Iterators automatically filter out expired entries based on TTL settings:
+
+```rust
+use slatedb::config::PutOptions;
+use std::time::Duration;
+
+// Write a key with TTL
+let put_opts = PutOptions {
+    ttl: slatedb::config::Ttl::ExpireAfter(Duration::from_secs(60)),
+};
+db.put_with_options(b"temp_key", b"temp_value", put_opts).await?;
+
+// Iterator will not return expired keys
+let mut iter = db.scan(..).await?;
+while let Some(kv) = iter.next().await? {
+    // Only non-expired keys are returned
+}
+```
+
+## Performance Considerations
+
+### Read-Ahead
+
+Configure read-ahead bytes in `ScanOptions` to improve sequential scan performance:
+
+```rust
+let options = ScanOptions::new()
+    .with_read_ahead_bytes(1024 * 1024); // 1MB read-ahead
+
+let mut iter = db.scan_with_options(.., options).await?;
+```
+
+### Block Caching
+
+Enable block caching to speed up repeated scans:
+
+```rust
+let options = ScanOptions::new()
+    .with_cache_blocks(true);
+
+let mut iter = db.scan_with_options(.., options).await?;
+```
+
+### Parallel Fetching
+
+Increase concurrent fetch tasks for better throughput on high-latency storage:
+
+```rust
+let options = ScanOptions::new()
+    .with_max_fetch_tasks(4); // Use 4 concurrent tasks
+
+let mut iter = db.scan_with_options(.., options).await?;
+```
+
+## Implementation Details
+
+### Internal Structure
+
+The iterator consists of:
+
+- **GetIterator**: Optimized for point lookups (single key)
+- **ScanIterator**: General-purpose range scanning
+- **MergeIterator**: Merges multiple data sources
+- **FilterIterator**: Applies sequence number and TTL filters
+
+### Data Source Order
+
+The iterator checks sources in the following order:
+
+1. **Write batch** (uncommitted transaction writes)
+2. **Memtables** (in-memory unflushed data)
+3. **L0 SSTables** (recently flushed data)
+4. **Sorted runs** (compacted data)
+
+### Tombstone Handling
+
+<Note>
+  Tombstones are used internally to mark deleted keys. The iterator automatically filters them out, so deleted keys are never returned to the user.
+</Note>
+
+## Error Handling
+
+Common errors when using iterators:
+
+### SeekKeyOutOfRange
+
+```rust
+let mut iter = db.scan(b"a"..b"z").await?;
+
+match iter.seek(b"0").await {
+    Err(e) if e.to_string().contains("out of range") => {
+        println!("Seek key is outside the scan range");
+    },
+    _ => {}
+}
+```
+
+### SeekKeyLessThanLastReturnedKey
+
+```rust
+let mut iter = db.scan(..).await?;
+let first = iter.next().await?;
+
+match iter.seek(b"a").await {
+    Err(e) if e.to_string().contains("less than") => {
+        println!("Cannot seek backward");
+    },
+    _ => {}
+}
+```
+
+### ChecksumMismatch
+
+```rust
+match iter.next().await {
+    Err(e) if e.to_string().contains("checksum mismatch") => {
+        println!("Data corruption detected");
+        // Iterator is now invalidated
+    },
+    _ => {}
+}
+```
+
+## See Also
+
+- [ScanOptions](/api/scan-options) - Configure scan behavior
+- [Db](/api/db) - Database API including scan methods
+- [Range Queries Guide](/guides/range-queries) - Practical scanning examples
+- [Transactions](/guides/transactions) - Use iterators within transactions

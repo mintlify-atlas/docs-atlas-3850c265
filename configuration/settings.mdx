@@ -1,0 +1,327 @@
+---
+title: Settings
+description: Core configuration options for SlateDB
+---
+
+The `Settings` struct represents the primary configuration options for SlateDB. These settings allow you to customize the database engine for your specific use case.
+
+## Configuration Formats
+
+SlateDB supports three configuration formats: TOML, JSON, and YAML. Duration options are represented as human-friendly strings (e.g., "100ms", "1s").
+
+## Loading Configuration
+
+<CodeGroup>
+```rust Default Settings
+use slatedb::config::Settings;
+let config = Settings::default();
+```
+
+```rust From File
+use slatedb::config::Settings;
+let config = Settings::from_file("config.toml")
+    .expect("Failed to load options from file");
+```
+
+```rust From Environment
+use slatedb::config::Settings;
+let config = Settings::from_env("SLATEDB_")
+    .expect("Failed to load options from env");
+```
+
+```rust Auto-load
+use slatedb::config::Settings;
+// Loads from SlateDb.{toml,json,yaml,yml} and SLATEDB_* env vars
+let config = Settings::load()
+    .expect("Failed to load options");
+```
+</CodeGroup>
+
+## Core Settings
+
+### Flush Configuration
+
+<ParamField path="flush_interval" type="Option<Duration>" default="100ms">
+  How frequently to flush the write-ahead log to object storage.
+
+  **Considerations:**
+  - **Latency**: Higher flush intervals increase write commit time and delay when readers see committed writes
+  - **API cost**: Lower flush intervals result in more frequent PUT calls to object storage
+  
+  **Recommendation**: Set based on your cost and latency tolerance. A 100ms flush interval results in approximately $130/month in PUT costs on S3 standard.
+  
+  <Note>The flush interval does not include network latency. A 100ms flush interval actually takes 100ms + network transfer time.</Note>
+  
+  If set to `None`, automatic flushing is disabled. You must manually call `Db::flush()` or close the database to flush data.
+</ParamField>
+
+<ParamField path="wal_enabled" type="bool" default="true">
+  When set to `false`, SlateDB disables the WAL and writes directly to the memtable.
+  
+  <Note>This option is only available when the `wal_disable` feature flag is enabled.</Note>
+</ParamField>
+
+### Manifest Configuration
+
+<ParamField path="manifest_poll_interval" type="Duration" default="1s">
+  How frequently to poll for new manifest files. Refreshing the manifest allows the database to:
+  - Detect fencing operations
+  - Discover newly compacted data
+</ParamField>
+
+<ParamField path="manifest_update_timeout" type="Duration" default="300s">
+  The maximum amount of time to wait for a manifest update before giving up.
+</ParamField>
+
+### Bloom Filter Configuration
+
+<ParamField path="min_filter_keys" type="u32" default="1000">
+  Write SSTables with a bloom filter only if the number of keys in the SSTable is greater than or equal to this value. Reads on small SSTables might be faster without a bloom filter.
+</ParamField>
+
+<ParamField path="filter_bits_per_key" type="u32" default="10">
+  The number of bits to use per key for bloom filters.
+  
+  A value of 10 yields a filter with an expected false positive probability (fpp) of ~0.0082.
+  
+  <Warning>
+  The fpp is evaluated per-sorted-run, so the expected number of false positives per request is `fpp * number of sorted runs`. For large databases with many runs, consider setting this higher if you have enough memory available.
+  </Warning>
+</ParamField>
+
+### L0 SSTable Configuration
+
+<ParamField path="l0_sst_size_bytes" type="usize" default="67108864">
+  The minimum size a memtable needs to be before it is frozen and flushed to L0 object storage (64 MiB default).
+  
+  Writes are still flushed to the WAL (based on `flush_interval`) regardless of this value. Memtable sizes are checked every `flush_interval`.
+  
+  **Considerations:**
+  - **Recovery time**: Larger thresholds mean less frequent writes, resulting in more recovery data in the WAL if a process restarts
+  - **Number of L0 SSTs/SRs**: Smaller thresholds create more SSTs and Sorted Runs, potentially slowing reads
+  - **Memory usage**: Larger thresholds allow the unflushed in-memory memtable to grow larger
+  - **API cost**: Smaller sizes result in more frequent writes to object storage
+  - **Secondary reader latency**: Secondary (non-writer) clients only see L0+ writes, not WAL writes
+</ParamField>
+
+<ParamField path="l0_max_ssts" type="usize" default="8">
+  Defines the maximum number of SSTs in L0. Memtables will not be flushed if there are more L0 SSTs than this value, until compaction compacts the SSTs.
+</ParamField>
+
+### Memory Configuration
+
+<ParamField path="max_unflushed_bytes" type="usize" default="1073741824">
+  Defines the maximum number of unflushed key/value pair bytes that should reside in memory before applying backpressure to writers (1 GiB default).
+  
+  This includes key/value pairs in both:
+  - The immutable WAL flush queue
+  - The immutable memtable flush queue
+  
+  Writes will be paused if the total unflushed bytes exceeds this value until data is flushed to object storage.
+</ParamField>
+
+### Compression Configuration
+
+<ParamField path="compression_codec" type="Option<CompressionCodec>" default="None">
+  The compression algorithm to use for SSTables.
+  
+  Available codecs (require feature flags):
+  - `Snappy` (requires `snappy` feature)
+  - `Zlib` (requires `zlib` feature)
+  - `Lz4` (requires `lz4` feature)
+  - `Zstd` (requires `zstd` feature)
+  
+  When `None`, no compression is applied.
+</ParamField>
+
+### TTL Configuration
+
+<ParamField path="default_ttl" type="Option<u64>" default="None">
+  The default time-to-live (TTL) for insertions in milliseconds.
+  
+  When a key is inserted or re-inserted, it will use this TTL unless a specific TTL is provided in `PutOptions`.
+  
+  When `None`, insertions will remain until explicitly deleted.
+</ParamField>
+
+### Nested Options
+
+<ParamField path="compactor_options" type="Option<CompactorOptions>">
+  Configuration options for the compactor. See [Compactor Configuration](/configuration/compactor) for details.
+  
+  <Note>This option is mutually exclusive with `DbBuilder::with_compactor_builder`. Setting both will result in an error.</Note>
+</ParamField>
+
+<ParamField path="object_store_cache_options" type="ObjectStoreCacheOptions">
+  Configuration options for the object store cache. See [Caching Configuration](/configuration/caching) for details.
+</ParamField>
+
+<ParamField path="garbage_collector_options" type="Option<GarbageCollectorOptions>">
+  Configuration options for the garbage collector. See [Garbage Collector Configuration](/configuration/garbage-collector) for details.
+</ParamField>
+
+## Configuration Examples
+
+<CodeGroup>
+```toml TOML
+flush_interval = "100ms"
+wal_enabled = false
+manifest_poll_interval = "1s"
+manifest_update_timeout = "300s"
+min_filter_keys = 1000
+filter_bits_per_key = 10
+l0_sst_size_bytes = 67108864
+l0_max_ssts = 8
+max_unflushed_bytes = 536870912
+
+[compactor_options]
+poll_interval = "5s"
+max_sst_size = 1073741824
+max_concurrent_compactions = 4
+
+[compactor_options.scheduler_options]
+min_compaction_sources = "4"
+max_compaction_sources = "8"
+include_size_threshold = "4.0"
+
+[object_store_cache_options]
+root_folder = "/tmp/slatedb-cache"
+max_cache_size_bytes = 17179869184
+part_size_bytes = 4194304
+scan_interval = "3600s"
+
+[garbage_collector_options.manifest_options]
+interval = "300s"
+min_age = "86400s"
+
+[garbage_collector_options.wal_options]
+interval = "60s"
+min_age = "60s"
+
+[garbage_collector_options.compacted_options]
+interval = "300s"
+min_age = "86400s"
+
+[garbage_collector_options.compactions_options]
+interval = "300s"
+min_age = "86400s"
+```
+
+```json JSON
+{
+  "flush_interval": "100ms",
+  "wal_enabled": false,
+  "manifest_poll_interval": "1s",
+  "manifest_update_timeout": "300s",
+  "min_filter_keys": 1000,
+  "filter_bits_per_key": 10,
+  "l0_sst_size_bytes": 67108864,
+  "l0_max_ssts": 8,
+  "max_unflushed_bytes": 536870912,
+  "compactor_options": {
+    "poll_interval": "5s",
+    "max_sst_size": 1073741824,
+    "max_concurrent_compactions": 4,
+    "scheduler_options": {
+      "min_compaction_sources": "4",
+      "max_compaction_sources": "8",
+      "include_size_threshold": "4.0"
+    }
+  },
+  "compression_codec": null,
+  "object_store_cache_options": {
+    "root_folder": "/tmp/slatedb-cache",
+    "max_cache_size_bytes": 17179869184,
+    "part_size_bytes": 4194304,
+    "scan_interval": "3600s"
+  },
+  "garbage_collector_options": {
+    "manifest_options": {
+      "interval": "300s",
+      "min_age": "86400s"
+    },
+    "wal_options": {
+      "interval": "60s",
+      "min_age": "60s"
+    },
+    "compacted_options": {
+      "interval": "300s",
+      "min_age": "86400s"
+    },
+    "compactions_options": {
+      "interval": "300s",
+      "min_age": "86400s"
+    }
+  }
+}
+```
+
+```yaml YAML
+flush_interval: '100ms'
+wal_enabled: false
+manifest_poll_interval: '1s'
+manifest_update_timeout: '300s'
+min_filter_keys: 1000
+filter_bits_per_key: 10
+l0_sst_size_bytes: 67108864
+l0_max_ssts: 8
+max_unflushed_bytes: 536870912
+compactor_options:
+  poll_interval: '5s'
+  max_sst_size: 1073741824
+  max_concurrent_compactions: 4
+  scheduler_options:
+    min_compaction_sources: "4"
+    max_compaction_sources: "8"
+    include_size_threshold: "4.0"
+compression_codec: null
+object_store_cache_options:
+  root_folder: /tmp/slatedb-cache
+  max_cache_size_bytes: 17179869184
+  part_size_bytes: 4194304
+  scan_interval: '3600s'
+garbage_collector_options:
+  manifest_options:
+    interval: '300s'
+    min_age: '86400s'
+  wal_options:
+    interval: '60s'
+    min_age: '60s'
+  compacted_options:
+    interval: '300s'
+    min_age: '86400s'
+  compactions_options:
+    interval: '300s'
+    min_age: '86400s'
+```
+</CodeGroup>
+
+## Environment Variables
+
+You can override settings using environment variables with the `SLATEDB_` prefix. Nested options use dot notation:
+
+```bash
+export SLATEDB_FLUSH_INTERVAL="200ms"
+export SLATEDB_L0_MAX_SSTS="16"
+export SLATEDB_OBJECT_STORE_CACHE_OPTIONS.ROOT_FOLDER="/var/cache/slatedb"
+export SLATEDB_COMPACTOR_OPTIONS.MAX_CONCURRENT_COMPACTIONS="8"
+```
+
+## Default Values
+
+When using `Settings::default()`, the following values are set:
+
+- `flush_interval`: `100ms`
+- `wal_enabled`: `true` (when `wal_disable` feature is enabled)
+- `manifest_poll_interval`: `1s`
+- `manifest_update_timeout`: `300s`
+- `min_filter_keys`: `1000`
+- `filter_bits_per_key`: `10`
+- `l0_sst_size_bytes`: `67108864` (64 MiB)
+- `l0_max_ssts`: `8`
+- `max_unflushed_bytes`: `1073741824` (1 GiB)
+- `compactor_options`: `Some(CompactorOptions::default())`
+- `compression_codec`: `None`
+- `object_store_cache_options`: `ObjectStoreCacheOptions::default()`
+- `garbage_collector_options`: `Some(GarbageCollectorOptions::default())`
+- `default_ttl`: `None`

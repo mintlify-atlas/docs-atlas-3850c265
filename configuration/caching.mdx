@@ -1,0 +1,393 @@
+---
+title: Caching
+description: Configuration options for SlateDB's caching layers
+---
+
+SlateDB provides two types of caching to improve read performance:
+
+1. **In-memory block cache** - Caches SSTable blocks, indexes, bloom filters, and stats in memory
+2. **Disk cache (Object Store Cache)** - Caches objects from remote object storage to local disk
+
+## Object Store Cache Options
+
+The `ObjectStoreCacheOptions` configure the local disk cache that mirrors remote object storage.
+
+<Info>
+  The object store cache is **disabled by default** unless an explicit cache root folder is set.
+</Info>
+
+### Configuration
+
+<ParamField path="root_folder" type="Option<PathBuf>" default="None">
+  The root folder where cache files are stored.
+  
+  When `None`, the disk cache is **disabled**. Set this to a local filesystem path to enable caching.
+  
+  **Example:** `/tmp/slatedb-cache` or `/var/cache/slatedb`
+</ParamField>
+
+<ParamField path="max_cache_size_bytes" type="Option<usize>">
+  The maximum cache size in bytes.
+  
+  **Default values:**
+  - 64-bit systems: `17179869184` (16 GiB)
+  - 32-bit systems: `4294967295` (4 GiB)
+  
+  When the cache exceeds this size, older entries are evicted using an LRU policy.
+</ParamField>
+
+<ParamField path="part_size_bytes" type="usize" default="4194304">
+  The size of each part file in bytes (4 MiB default).
+  
+  Objects from the object store are split into aligned parts of this size and cached individually. This allows partial object caching and efficient range reads.
+  
+  **Requirement:** Part size must be aligned with 1 KiB (1024 bytes).
+</ParamField>
+
+<ParamField path="cache_puts" type="bool" default="false">
+  Whether to cache PUT operations to disk.
+  
+  When enabled, data written via PUT operations will be cached locally for faster subsequent reads. This is useful when you expect to read recently written data frequently.
+</ParamField>
+
+<ParamField path="preload_disk_cache_on_startup" type="Option<PreloadLevel>" default="None">
+  Whether to preload SST files into cache during database startup.
+  
+  When enabled, the database will load SST files into the cache up to the cache size limit to warm up the cache for faster initial access.
+  
+  **Options:**
+  - `None`: No preloading (default)
+  - `L0Sst`: Preload only L0 SSTs (most recently written files)
+  - `AllSst`: Preload all SSTs (both L0 and compacted levels)
+</ParamField>
+
+<ParamField path="scan_interval" type="Option<Duration>" default="3600s">
+  Interval to scan the cache directory to rebuild the in-memory map for the evictor (1 hour default).
+  
+  When `None`, the cache directory is only scanned once on startup. Regular scanning helps the cache maintain accurate usage statistics for eviction.
+</ParamField>
+
+## In-Memory Block Cache
+
+The in-memory cache stores SSTable blocks, indexes, bloom filters, and statistics for fast access.
+
+### Built-in Implementations
+
+SlateDB provides two built-in cache implementations:
+
+<AccordionGroup>
+  <Accordion title="Foyer Cache" icon="rabbit-running" defaultOpen>
+    The Foyer cache is a high-performance caching library that supports both in-memory and hybrid (memory + disk) caching.
+    
+    **Enabled with:** `foyer` feature flag (enabled by default)
+    
+    **Default capacities:**
+    - Block cache: `536870912` (512 MiB)
+    - Meta cache: `134217728` (128 MiB)
+    
+    Foyer provides excellent performance and is recommended for most use cases.
+  </Accordion>
+  
+  <Accordion title="Moka Cache" icon="database">
+    The Moka cache is a pure in-memory cache with support for time-based eviction policies.
+    
+    **Enabled with:** `moka` feature flag
+    
+    **Default capacities:**
+    - Block cache: `536870912` (512 MiB)
+    - Meta cache: `134217728` (128 MiB)
+    
+    Moka is useful when you need TTL or TTI eviction policies.
+  </Accordion>
+</AccordionGroup>
+
+### Custom Cache Implementation
+
+You can implement the `DbCache` trait to provide your own caching solution:
+
+```rust
+use async_trait::async_trait;
+use slatedb::db_cache::{DbCache, CachedEntry, CachedKey};
+use slatedb::Error;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
+struct MyCache {
+    inner: Mutex<HashMap<CachedKey, CachedEntry>>,
+    capacity: u64,
+}
+
+impl MyCache {
+    pub fn new(capacity: u64) -> Self {
+        Self {
+            inner: Mutex::new(HashMap::new()),
+            capacity,
+        }
+    }
+}
+
+#[async_trait]
+impl DbCache for MyCache {
+    async fn get_block(&self, key: &CachedKey) -> Result<Option<CachedEntry>, Error> {
+        let guard = self.inner.lock().unwrap();
+        Ok(guard.get(key).cloned())
+    }
+
+    async fn get_index(&self, key: &CachedKey) -> Result<Option<CachedEntry>, Error> {
+        let guard = self.inner.lock().unwrap();
+        Ok(guard.get(key).cloned())
+    }
+
+    async fn get_filter(&self, key: &CachedKey) -> Result<Option<CachedEntry>, Error> {
+        let guard = self.inner.lock().unwrap();
+        Ok(guard.get(key).cloned())
+    }
+
+    async fn get_stats(&self, key: &CachedKey) -> Result<Option<CachedEntry>, Error> {
+        let guard = self.inner.lock().unwrap();
+        Ok(guard.get(key).cloned())
+    }
+
+    async fn insert(&self, key: CachedKey, value: CachedEntry) {
+        let mut guard = self.inner.lock().unwrap();
+        guard.insert(key, value);
+    }
+
+    async fn remove(&self, key: &CachedKey) {
+        let mut guard = self.inner.lock().unwrap();
+        guard.remove(key);
+    }
+
+    fn entry_count(&self) -> u64 {
+        let guard = self.inner.lock().unwrap();
+        guard.len() as u64
+    }
+}
+```
+
+### Using a Custom Cache
+
+```rust
+use slatedb::Db;
+use slatedb::object_store::memory::InMemory;
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() {
+    let object_store = Arc::new(InMemory::new());
+    let cache = Arc::new(MyCache::new(128 * 1024 * 1024));
+    
+    let db = Db::builder("/path/to/db", object_store)
+        .with_db_cache(cache)
+        .build()
+        .await;
+}
+```
+
+## Configuration Examples
+
+<CodeGroup>
+```toml TOML
+[object_store_cache_options]
+root_folder = "/tmp/slatedb-cache"
+max_cache_size_bytes = 17179869184  # 16 GiB
+part_size_bytes = 4194304  # 4 MiB
+cache_puts = true
+preload_disk_cache_on_startup = "AllSst"
+scan_interval = "3600s"  # 1 hour
+```
+
+```json JSON
+{
+  "object_store_cache_options": {
+    "root_folder": "/tmp/slatedb-cache",
+    "max_cache_size_bytes": 17179869184,
+    "part_size_bytes": 4194304,
+    "cache_puts": true,
+    "preload_disk_cache_on_startup": "AllSst",
+    "scan_interval": "3600s"
+  }
+}
+```
+
+```yaml YAML
+object_store_cache_options:
+  root_folder: /tmp/slatedb-cache
+  max_cache_size_bytes: 17179869184
+  part_size_bytes: 4194304
+  cache_puts: true
+  preload_disk_cache_on_startup: AllSst
+  scan_interval: '3600s'
+```
+
+```rust Rust
+use slatedb::config::{Settings, ObjectStoreCacheOptions, PreloadLevel};
+use std::path::PathBuf;
+use std::time::Duration;
+
+let cache_opts = ObjectStoreCacheOptions {
+    root_folder: Some(PathBuf::from("/tmp/slatedb-cache")),
+    max_cache_size_bytes: Some(16 * 1024 * 1024 * 1024),
+    part_size_bytes: 4 * 1024 * 1024,
+    cache_puts: true,
+    preload_disk_cache_on_startup: Some(PreloadLevel::AllSst),
+    scan_interval: Some(Duration::from_secs(3600)),
+};
+
+let settings = Settings {
+    object_store_cache_options: cache_opts,
+    ..Settings::default()
+};
+```
+</CodeGroup>
+
+## Environment Variables
+
+You can configure caching via environment variables:
+
+```bash
+export SLATEDB_OBJECT_STORE_CACHE_OPTIONS.ROOT_FOLDER="/var/cache/slatedb"
+export SLATEDB_OBJECT_STORE_CACHE_OPTIONS.MAX_CACHE_SIZE_BYTES="34359738368"  # 32 GiB
+export SLATEDB_OBJECT_STORE_CACHE_OPTIONS.PART_SIZE_BYTES="8388608"  # 8 MiB
+export SLATEDB_OBJECT_STORE_CACHE_OPTIONS.CACHE_PUTS="true"
+export SLATEDB_OBJECT_STORE_CACHE_OPTIONS.SCAN_INTERVAL="7200s"  # 2 hours
+```
+
+## Tuning Recommendations
+
+### High-Performance Configuration
+
+For maximum read performance with abundant storage:
+
+```toml
+[object_store_cache_options]
+root_folder = "/var/cache/slatedb"
+max_cache_size_bytes = 107374182400  # 100 GiB
+part_size_bytes = 8388608  # 8 MiB (larger parts)
+cache_puts = true
+preload_disk_cache_on_startup = "AllSst"
+scan_interval = "1800s"  # 30 minutes
+```
+
+### Memory-Constrained Configuration
+
+For environments with limited disk space:
+
+```toml
+[object_store_cache_options]
+root_folder = "/tmp/slatedb-cache"
+max_cache_size_bytes = 1073741824  # 1 GiB
+part_size_bytes = 2097152  # 2 MiB (smaller parts)
+cache_puts = false
+preload_disk_cache_on_startup = "L0Sst"  # Only recent data
+scan_interval = "7200s"  # 2 hours
+```
+
+### Write-Heavy Workload
+
+For workloads with frequent writes and immediate reads:
+
+```toml
+[object_store_cache_options]
+root_folder = "/var/cache/slatedb"
+max_cache_size_bytes = 17179869184  # 16 GiB
+part_size_bytes = 4194304  # 4 MiB
+cache_puts = true  # Cache writes for immediate reads
+preload_disk_cache_on_startup = "L0Sst"
+scan_interval = "3600s"
+```
+
+### Read-Heavy Workload
+
+For workloads dominated by reads:
+
+```toml
+[object_store_cache_options]
+root_folder = "/var/cache/slatedb"
+max_cache_size_bytes = 53687091200  # 50 GiB
+part_size_bytes = 8388608  # 8 MiB
+cache_puts = false
+preload_disk_cache_on_startup = "AllSst"  # Warm cache on startup
+scan_interval = "3600s"
+```
+
+### Optimizing Part Size
+
+The `part_size_bytes` setting affects cache efficiency:
+
+- **Smaller parts (1-2 MiB):**
+  - Better for random access patterns
+  - More granular caching
+  - Higher metadata overhead
+
+- **Larger parts (8-16 MiB):**
+  - Better for sequential scans
+  - Less metadata overhead
+  - May cache unnecessary data for point queries
+
+## Disabling Caching
+
+### Disable Disk Cache
+
+To disable the disk cache, simply omit the `root_folder` or set it to `None`:
+
+<CodeGroup>
+```toml TOML
+[object_store_cache_options]
+root_folder = null
+```
+
+```rust Rust
+use slatedb::config::ObjectStoreCacheOptions;
+
+let cache_opts = ObjectStoreCacheOptions {
+    root_folder: None,  // Disk cache disabled
+    ..ObjectStoreCacheOptions::default()
+};
+```
+</CodeGroup>
+
+### Disable In-Memory Cache
+
+To disable the in-memory cache, don't provide a cache to the builder:
+
+```rust
+use slatedb::Db;
+use slatedb::object_store::memory::InMemory;
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() {
+    let object_store = Arc::new(InMemory::new());
+    
+    let db = Db::builder("/path/to/db", object_store)
+        // No .with_db_cache() call
+        .build()
+        .await;
+}
+```
+
+<Warning>
+  Disabling caching will significantly degrade read performance, as every read will require fetching data from object storage.
+</Warning>
+
+## Read Options and Caching
+
+You can control caching behavior per-read operation using `ReadOptions` and `ScanOptions`:
+
+```rust
+use slatedb::config::{ReadOptions, ScanOptions};
+
+// Disable caching for this specific read
+let read_opts = ReadOptions::default().with_cache_blocks(false);
+let value = db.get_with_options(b"key", read_opts).await?;
+
+// Disable caching for this specific scan
+let scan_opts = ScanOptions::default().with_cache_blocks(false);
+let iter = db.scan_with_options(b"start"..b"end", scan_opts).await?;
+```
+
+This is useful for:
+- One-time bulk scans that shouldn't pollute the cache
+- Testing without cache effects
+- Accessing cold data that won't be read again

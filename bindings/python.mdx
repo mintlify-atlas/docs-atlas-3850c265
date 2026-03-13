@@ -1,0 +1,498 @@
+---
+title: 'Python'
+description: 'Use SlateDB in Python applications with sync and async APIs'
+---
+
+SlateDB provides official Python bindings with both synchronous and asynchronous APIs. The bindings are built using PyO3 and Maturin, providing native performance.
+
+## Requirements
+
+- Python 3.10 or higher
+- pip or uv package manager
+
+## Installation
+
+Install from PyPI:
+
+<CodeGroup>
+```bash pip
+pip install slatedb
+```
+
+```bash uv
+uv pip install slatedb
+```
+</CodeGroup>
+
+## Basic Usage
+
+```python
+from slatedb import SlateDB
+
+# Open database with in-memory object store
+db = SlateDB("/tmp/slatedb-demo", url="memory:///")
+
+# Put a key-value pair
+db.put(b"hello", b"world")
+
+# Get a value
+value = db.get(b"hello")
+print(f"Value: {value}")  # b"world"
+
+# Delete a key
+db.delete(b"hello")
+
+# Close the database
+db.close()
+```
+
+## Object Store Configuration
+
+### In-Memory (Testing)
+
+```python
+db = SlateDB("/tmp/cache", url="memory:///")
+```
+
+### Local Filesystem
+
+```python
+db = SlateDB("/tmp/cache", url="file:///tmp/slatedb-store")
+```
+
+### AWS S3
+
+```python
+# Option 1: Direct URL
+db = SlateDB("/tmp/cache", url="s3://my-bucket")
+
+# Option 2: Environment variables
+import os
+os.environ["AWS_BUCKET"] = "my-bucket"
+os.environ["AWS_REGION"] = "us-west-2"
+db = SlateDB("/tmp/cache")
+```
+
+### Google Cloud Storage
+
+```python
+db = SlateDB("/tmp/cache", url="gs://my-bucket")
+```
+
+### Azure Blob Storage
+
+```python
+db = SlateDB("/tmp/cache", url="az://my-container")
+```
+
+## Write Operations
+
+### Basic Put
+
+```python
+db.put(b"key", b"value")
+```
+
+### Put with Options
+
+```python
+# Set TTL (time-to-live) in milliseconds
+db.put_with_options(b"temp-key", b"value", ttl=5000)
+
+# Non-durable put (lower latency, less durability)
+db.put_with_options(b"fast-key", b"value", await_durable=False)
+
+# Combine options
+db.put_with_options(
+    b"session:123",
+    b"user-data",
+    ttl=3600000,  # 1 hour
+    await_durable=False
+)
+```
+
+## Batched Writes
+
+Execute multiple operations atomically:
+
+```python
+from slatedb import WriteBatch
+
+batch = WriteBatch()
+batch.put(b"user:1", b"alice")
+batch.put(b"user:2", b"bob")
+batch.delete(b"user:0")
+
+# Commit atomically
+db.write(batch)
+```
+
+## Range Scans
+
+Iterate over key ranges:
+
+```python
+# Scan with prefix (end omitted)
+iterator = db.scan(b"user:")
+for key, value in iterator:
+    print(f"{key} = {value}")
+
+# Scan with explicit range
+iterator = db.scan(b"user:1", b"user:3")
+for key, value in iterator:
+    print(f"{key} = {value}")
+
+# Scan all keys
+iterator = db.scan(b"")
+for key, value in iterator:
+    print(f"{key} = {value}")
+```
+
+### Seek in Iterators
+
+```python
+iterator = db.scan(b"a")
+
+# Get first item
+first = next(iterator)
+print(f"First: {first}")
+
+# Seek to specific key
+iterator.seek(b"m")
+
+# Continue from "m"
+for key, value in iterator:
+    print(f"{key} = {value}")
+```
+
+### Scan with Options
+
+```python
+iterator = db.scan_with_options(
+    b"user:",
+    cache_blocks=True,           # Enable block caching
+    read_ahead_bytes=1 << 20,    # 1 MB read-ahead
+)
+
+results = list(iterator)
+```
+
+## Transactions
+
+SlateDB supports ACID transactions with two isolation levels:
+
+### Serializable Snapshot Isolation (SSI)
+
+```python
+# Create SSI transaction
+txn = db.begin("ssi")
+
+try:
+    txn.put(b"account:1", b"100")
+    balance = txn.get(b"account:2")
+
+    # Operations are buffered until commit
+    txn.commit()
+except Exception as e:
+    # Transaction will auto-abort on error
+    print(f"Transaction failed: {e}")
+```
+
+### Snapshot Isolation (SI)
+
+```python
+txn = db.begin("si")
+
+txn.put(b"key1", b"value1")
+txn.delete(b"key2")
+txn.commit()
+```
+
+### Transaction API
+
+```python
+txn = db.begin("ssi")
+
+# Read operations
+value = txn.get(b"key")
+
+# Write operations
+txn.put(b"key", b"value")
+txn.delete(b"old-key")
+txn.merge(b"counter", b"1")  # Requires merge operator
+
+# Scanning
+for key, value in txn.scan(b"prefix:"):
+    print(f"{key} = {value}")
+
+# Commit or abort
+txn.commit()  # Make changes durable
+# or
+txn.abort()   # Discard changes
+```
+
+## Snapshots
+
+Create consistent, read-only views:
+
+```python
+# Create snapshot
+snapshot = db.snapshot()
+
+# Read from snapshot
+value = snapshot.get(b"key")
+
+# Scan snapshot
+for key, value in snapshot.scan(b"prefix:"):
+    print(f"{key} = {value}")
+
+# Snapshots are read-only
+# snapshot.put(...)  # This would raise an error
+```
+
+## Merge Operator
+
+Define custom merge logic for conflict resolution:
+
+```python
+def concat_merge(key: bytes, existing: bytes | None, value: bytes) -> bytes:
+    """Concatenate values."""
+    return (existing or b"") + value
+
+def counter_merge(key: bytes, existing: bytes | None, value: bytes) -> bytes:
+    """Sum integer values."""
+    existing_val = int(existing) if existing else 0
+    new_val = int(value)
+    return str(existing_val + new_val).encode()
+
+# Open database with merge operator
+db = SlateDB(
+    "/tmp/cache",
+    url="memory:///",
+    merge_operator=concat_merge
+)
+
+# Use merge operation
+db.merge(b"log", b"entry1\n")
+db.merge(b"log", b"entry2\n")
+db.merge(b"log", b"entry3\n")
+
+# Result: b"entry1\nentry2\nentry3\n"
+result = db.get(b"log")
+```
+
+## Checkpoints
+
+Create and manage durable checkpoints:
+
+```python
+# Create a checkpoint
+checkpoint = db.create_checkpoint(scope="durable")
+print(f"Checkpoint ID: {checkpoint['id']}")
+
+# Open reader at specific checkpoint
+from slatedb import SlateDBReader
+
+reader = SlateDBReader(
+    "/tmp/cache",
+    url="memory:///",
+    checkpoint_id=checkpoint["id"]
+)
+
+# Read from checkpoint
+value = reader.get(b"key")
+for key, value in reader.scan(b"prefix:"):
+    print(f"{key} = {value}")
+
+reader.close()
+```
+
+## Read-Only Access
+
+Use `SlateDBReader` for read-only workloads:
+
+```python
+from slatedb import SlateDBReader
+
+# Open reader (no writes allowed)
+reader = SlateDBReader("/tmp/cache", url="memory:///")
+
+# Read operations
+value = reader.get(b"key")
+
+# Scanning
+for key, value in reader.scan(b"prefix:"):
+    print(f"{key} = {value}")
+
+reader.close()
+```
+
+## Admin Operations
+
+Perform administrative tasks:
+
+```python
+from slatedb import SlateDBAdmin
+
+admin = SlateDBAdmin("/tmp/cache", url="memory:///")
+
+# List checkpoints
+checkpoints = admin.list_checkpoints()
+for ckpt in checkpoints:
+    print(f"Checkpoint: {ckpt['id']} at {ckpt['timestamp']}")
+
+# Read manifest
+manifest = admin.read_manifest()
+print(f"Manifest: {manifest}")
+
+# Run garbage collection
+admin.run_gc_once(
+    manifest_min_age=0,
+    wal_min_age=0,
+    compacted_min_age=0
+)
+
+# Clone database
+admin.clone_db(
+    source_path="/tmp/source",
+    dest_path="/tmp/dest",
+    source_url="memory:///",
+    dest_url="memory:///"
+)
+```
+
+## Metrics
+
+Get database metrics:
+
+```python
+metrics = db.metrics()
+print(f"Metrics: {metrics}")
+```
+
+## Flush Operations
+
+```python
+# Flush with default scope
+db.flush()
+
+# Flush only WAL
+db.flush_with_options("wal")
+
+# Flush memtable
+db.flush_with_options("memtable")
+```
+
+## Async API
+
+All operations have async equivalents:
+
+```python
+import asyncio
+from slatedb import AsyncSlateDB
+
+async def main():
+    db = await AsyncSlateDB.open("/tmp/cache", url="memory:///")
+
+    await db.put(b"key", b"value")
+    value = await db.get(b"key")
+
+    # Async iteration
+    async for key, value in db.scan(b"prefix:"):
+        print(f"{key} = {value}")
+
+    await db.close()
+
+asyncio.run(main())
+```
+
+## Complete Example
+
+```python
+from slatedb import SlateDB, SlateDBReader, WriteBatch
+
+# Define merge operator
+def concat(key: bytes, existing: bytes | None, value: bytes) -> bytes:
+    return (existing or b"") + value
+
+# Open database
+db = SlateDB("/tmp/demo", url="memory:///", merge_operator=concat)
+
+# Basic operations
+db.put(b"user:1", b"Alice")
+assert db.get(b"user:1") == b"Alice"
+
+# Batched writes
+batch = WriteBatch()
+batch.put(b"user:2", b"Bob")
+batch.put(b"user:3", b"Charlie")
+db.write(batch)
+
+# Transactions
+txn = db.begin("ssi")
+txn.put(b"user:4", b"David")
+txn.merge(b"log", b"Added David\n")
+txn.commit()
+
+# Snapshots
+snap = db.snapshot()
+assert snap.get(b"user:1") == b"Alice"
+
+# Range scans
+for key, value in db.scan(b"user:"):
+    print(f"{key.decode()} = {value.decode()}")
+
+# Create checkpoint
+ckpt = db.create_checkpoint(scope="durable")
+
+# Read from checkpoint
+reader = SlateDBReader(
+    "/tmp/demo",
+    url="memory:///",
+    checkpoint_id=ckpt["id"]
+)
+assert reader.get(b"user:1") == b"Alice"
+reader.close()
+
+# Cleanup
+db.close()
+```
+
+## Development
+
+To develop the Python bindings:
+
+```bash
+# Install uv
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# Create virtual environment
+uv venv
+
+# Install dependencies
+uv pip install -e .[test]
+
+# Build with Maturin
+uv tool install maturin
+uv run maturin develop
+
+# Run tests
+uv run pytest
+```
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Transactions" icon="rotate" href="/guides/transactions">
+    Learn about ACID transactions with SSI and SI
+  </Card>
+  <Card title="Snapshots" icon="camera" href="/guides/snapshots">
+    Create consistent point-in-time views
+  </Card>
+  <Card title="Merge Operator" icon="code-merge" href="/guides/merge-operator">
+    Implement custom merge logic
+  </Card>
+  <Card title="Object Storage" icon="database" href="/object-storage/overview">
+    Configure S3, GCS, Azure, and more
+  </Card>
+</CardGroup>

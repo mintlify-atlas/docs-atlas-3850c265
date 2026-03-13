@@ -1,0 +1,404 @@
+---
+title: Key-Value Types
+description: Core types for working with key-value data in SlateDB
+---
+
+## Overview
+
+SlateDB provides several types for working with key-value data:
+- `KeyValue` - A key-value pair guaranteed not to be a tombstone
+- `RowEntry` - A key-value pair that may be a tombstone or merge operand
+- `ValueDeletable` - Enum distinguishing between values, merge operands, and tombstones
+
+## KeyValue
+
+Represents a key-value pair known not to be a tombstone.
+
+```rust
+pub struct KeyValue {
+    pub key: Bytes,
+    pub value: Bytes,
+    pub seq: u64,
+    pub create_ts: i64,
+    pub expire_ts: Option<i64>,
+}
+```
+
+### Fields
+
+#### `key: Bytes`
+
+The key as a byte array.
+
+#### `value: Bytes`
+
+The value as a byte array. Always contains a value (never a tombstone).
+
+#### `seq: u64`
+
+The sequence number of this key-value pair. Higher sequence numbers indicate more recent updates.
+
+#### `create_ts: i64`
+
+The creation timestamp in Unix time (milliseconds since epoch).
+
+#### `expire_ts: Option<i64>`
+
+Optional expiration timestamp in Unix time. If set, this key-value pair should be removed after this time.
+
+### Example
+
+```rust
+use slatedb::Db;
+use bytes::Bytes;
+
+let db = Db::open_with_opts(...).await?;
+
+// Get returns Option<KeyValue>
+if let Some(kv) = db.get(b"user:123").await? {
+    println!("Key: {:?}", kv.key);
+    println!("Value: {:?}", kv.value);
+    println!("Sequence: {}", kv.seq);
+    println!("Created: {}", kv.create_ts);
+    if let Some(expire) = kv.expire_ts {
+        println!("Expires: {}", expire);
+    }
+}
+```
+
+## RowEntry
+
+Represents a key-value pair that may be a tombstone. This is the entry type passed to compaction filters.
+
+```rust
+pub struct RowEntry {
+    pub key: Bytes,
+    pub value: ValueDeletable,
+    pub seq: u64,
+    pub create_ts: Option<i64>,
+    pub expire_ts: Option<i64>,
+}
+```
+
+### Fields
+
+#### `key: Bytes`
+
+The key bytes.
+
+#### `value: ValueDeletable`
+
+The value, which may be a regular value, merge operand, or tombstone.
+
+#### `seq: u64`
+
+The sequence number of this entry.
+
+#### `create_ts: Option<i64>`
+
+The creation timestamp (if set).
+
+#### `expire_ts: Option<i64>`
+
+The expiration timestamp (if set).
+
+### Methods
+
+#### `estimated_size(&self) -> usize`
+
+Returns an estimated size of this entry in bytes, including key, value, sequence number, and timestamps.
+
+**Example:**
+```rust
+let size = row_entry.estimated_size();
+println!("Estimated size: {} bytes", size);
+```
+
+#### `encoded_size(&self, key_prefix_len: usize) -> usize`
+
+Returns the encoded size of this entry when written to an SST block. The `key_prefix_len` is the number of bytes shared with the block's first key.
+
+**Example:**
+```rust
+let encoded_size = row_entry.encoded_size(0);
+println!("Encoded size: {} bytes", encoded_size);
+```
+
+### Conversion
+
+#### `From<RowEntry> for KeyValue`
+
+Converts a `RowEntry` to a `KeyValue`. Panics if the entry is a tombstone.
+
+**Example:**
+```rust
+let row_entry = RowEntry { /* ... */ };
+if !row_entry.value.is_tombstone() {
+    let kv: KeyValue = row_entry.into();
+}
+```
+
+### Example with Compaction Filters
+
+```rust
+use slatedb::compaction_filter::{CompactionFilter, CompactionFilterDecision};
+use slatedb::types::{RowEntry, ValueDeletable};
+
+struct MyFilter;
+
+impl CompactionFilter for MyFilter {
+    fn filter(&self, entry: &RowEntry) -> CompactionFilterDecision {
+        // Filter out expired entries
+        if let Some(expire_ts) = entry.expire_ts {
+            let now = current_timestamp();
+            if now > expire_ts {
+                return CompactionFilterDecision::Drop;
+            }
+        }
+        
+        // Keep tombstones for a while
+        if entry.value.is_tombstone() {
+            if let Some(create_ts) = entry.create_ts {
+                let age = current_timestamp() - create_ts;
+                if age > 86400000 { // 24 hours
+                    return CompactionFilterDecision::Drop;
+                }
+            }
+        }
+        
+        CompactionFilterDecision::Keep
+    }
+}
+```
+
+## ValueDeletable
+
+Represents a value for a key, distinguishing between regular values, merge operands, and tombstones.
+
+```rust
+pub enum ValueDeletable {
+    Value(Bytes),
+    Merge(Bytes),
+    Tombstone,
+}
+```
+
+### Variants
+
+#### `Value(Bytes)`
+
+A regular value entry.
+
+**Example:**
+```rust
+let value = ValueDeletable::Value(Bytes::from("hello"));
+```
+
+#### `Merge(Bytes)`
+
+A merge operand, used with merge operators to combine multiple updates.
+
+**Example:**
+```rust
+let merge = ValueDeletable::Merge(Bytes::from("+1"));
+```
+
+#### `Tombstone`
+
+A deletion marker indicating the key has been deleted.
+
+**Example:**
+```rust
+let tombstone = ValueDeletable::Tombstone;
+```
+
+### Methods
+
+#### `len(&self) -> usize`
+
+Returns the length of the value in bytes, or 0 for tombstones.
+
+**Example:**
+```rust
+let value = ValueDeletable::Value(Bytes::from("hello"));
+assert_eq!(value.len(), 5);
+
+let tombstone = ValueDeletable::Tombstone;
+assert_eq!(tombstone.len(), 0);
+```
+
+#### `is_tombstone(&self) -> bool`
+
+Returns `true` if this is a tombstone (deletion marker).
+
+**Example:**
+```rust
+let value = ValueDeletable::Value(Bytes::from("hello"));
+assert!(!value.is_tombstone());
+
+let tombstone = ValueDeletable::Tombstone;
+assert!(tombstone.is_tombstone());
+```
+
+#### `as_bytes(&self) -> Option<Bytes>`
+
+Returns the value bytes if this is a `Value` or `Merge`, `None` for `Tombstone`.
+
+**Example:**
+```rust
+let value = ValueDeletable::Value(Bytes::from("hello"));
+assert_eq!(value.as_bytes(), Some(Bytes::from("hello")));
+
+let tombstone = ValueDeletable::Tombstone;
+assert_eq!(tombstone.as_bytes(), None);
+```
+
+## Working with Key-Value Data
+
+### Basic Read Operation
+
+```rust
+use slatedb::Db;
+
+let db = Db::open_with_opts(...).await?;
+
+// Get returns Option<KeyValue>
+match db.get(b"key").await? {
+    Some(kv) => {
+        println!("Found value: {:?}", kv.value);
+    }
+    None => {
+        println!("Key not found");
+    }
+}
+```
+
+### Write Operation
+
+```rust
+use slatedb::Db;
+
+let db = Db::open_with_opts(...).await?;
+
+// Write a key-value pair
+db.put(b"key", b"value").await?;
+
+// Delete a key (creates a tombstone internally)
+db.delete(b"key").await?;
+```
+
+### Working with Expiration
+
+```rust
+use slatedb::{Db, WriteOptions};
+use std::time::SystemTime;
+
+let db = Db::open_with_opts(...).await?;
+
+// Calculate expiration time (1 hour from now)
+let now = SystemTime::now()
+    .duration_since(SystemTime::UNIX_EPOCH)
+    .unwrap()
+    .as_millis() as i64;
+let expire_at = now + 3600000; // 1 hour in milliseconds
+
+// Write with expiration
+let mut opts = WriteOptions::default();
+opts.expire_ts = Some(expire_at);
+db.put_with_options(b"session:abc", b"user_data", opts).await?;
+
+// Later, when reading
+if let Some(kv) = db.get(b"session:abc").await? {
+    if let Some(expire_ts) = kv.expire_ts {
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        
+        if now > expire_ts {
+            println!("Value has expired");
+        } else {
+            println!("Value is still valid");
+        }
+    }
+}
+```
+
+### Iterating Over Key-Value Pairs
+
+```rust
+use slatedb::Db;
+
+let db = Db::open_with_opts(...).await?;
+
+// Create an iterator
+let mut iter = db.iter().await?;
+
+// Iterate over all key-value pairs
+while let Some(kv) = iter.next().await? {
+    println!("Key: {:?}, Value: {:?}", kv.key, kv.value);
+    println!("Sequence: {}, Created: {}", kv.seq, kv.create_ts);
+}
+```
+
+### Range Scans
+
+```rust
+use slatedb::Db;
+use std::ops::Bound;
+
+let db = Db::open_with_opts(...).await?;
+
+// Scan keys from "user:100" to "user:200" (exclusive)
+let start = Bound::Included(b"user:100".to_vec());
+let end = Bound::Excluded(b"user:200".to_vec());
+
+let mut iter = db.range(start, end).await?;
+
+while let Some(kv) = iter.next().await? {
+    println!("User key: {:?}, data: {:?}", kv.key, kv.value);
+}
+```
+
+### Checking Value Type in Compaction
+
+```rust
+use slatedb::types::{RowEntry, ValueDeletable};
+
+fn process_entry(entry: &RowEntry) {
+    match &entry.value {
+        ValueDeletable::Value(bytes) => {
+            println!("Regular value: {} bytes", bytes.len());
+        }
+        ValueDeletable::Merge(bytes) => {
+            println!("Merge operand: {} bytes", bytes.len());
+        }
+        ValueDeletable::Tombstone => {
+            println!("Tombstone (deleted key)");
+        }
+    }
+}
+```
+
+### Size Estimation
+
+```rust
+use slatedb::types::RowEntry;
+use bytes::Bytes;
+
+let entry = RowEntry {
+    key: Bytes::from("user:123"),
+    value: ValueDeletable::Value(Bytes::from("user_data")),
+    seq: 42,
+    create_ts: Some(1234567890),
+    expire_ts: None,
+};
+
+// Estimate memory usage
+let estimated = entry.estimated_size();
+println!("Estimated memory: {} bytes", estimated);
+
+// Calculate encoded size for storage
+let encoded = entry.encoded_size(0);
+println!("Encoded size: {} bytes", encoded);
+```
