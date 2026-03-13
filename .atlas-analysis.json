@@ -1,0 +1,174 @@
+{
+  "projectType": "sdk-library",
+  "projectName": "SlateDB",
+  "projectDescription": "A cloud native embedded storage engine built on object storage",
+  "theme": "aspen",
+  "primaryColor": "#040404",
+  "lightColor": null,
+  "darkColor": null,
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "quickstart",
+              "installation"
+            ]
+          },
+          {
+            "group": "Core Concepts",
+            "pages": [
+              "concepts/architecture",
+              "concepts/lsm-tree",
+              "concepts/object-storage",
+              "concepts/wal",
+              "concepts/compaction"
+            ]
+          },
+          {
+            "group": "Guides",
+            "pages": [
+              "guides/basic-operations",
+              "guides/transactions",
+              "guides/snapshots",
+              "guides/checkpoints",
+              "guides/range-queries",
+              "guides/merge-operator",
+              "guides/change-data-capture"
+            ]
+          },
+          {
+            "group": "Configuration",
+            "pages": [
+              "configuration/settings",
+              "configuration/compactor",
+              "configuration/garbage-collector",
+              "configuration/caching"
+            ]
+          },
+          {
+            "group": "Object Storage",
+            "pages": [
+              "object-storage/overview",
+              "object-storage/aws-s3",
+              "object-storage/google-cloud-storage",
+              "object-storage/azure-blob",
+              "object-storage/s3-compatible"
+            ]
+          },
+          {
+            "group": "Language Bindings",
+            "pages": [
+              "bindings/rust",
+              "bindings/go",
+              "bindings/java",
+              "bindings/python"
+            ]
+          },
+          {
+            "group": "Advanced",
+            "pages": [
+              "advanced/compaction-filters",
+              "advanced/custom-comparators",
+              "advanced/standalone-compactor",
+              "advanced/performance-tuning"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "API Reference",
+        "groups": [
+          {
+            "group": "Core API",
+            "pages": [
+              "api/db",
+              "api/db-builder",
+              "api/db-reader",
+              "api/write-handle"
+            ]
+          },
+          {
+            "group": "Transactions",
+            "pages": [
+              "api/db-transaction",
+              "api/isolation-level"
+            ]
+          },
+          {
+            "group": "Snapshots & Checkpoints",
+            "pages": [
+              "api/db-snapshot",
+              "api/checkpoint"
+            ]
+          },
+          {
+            "group": "Iteration",
+            "pages": [
+              "api/db-iterator",
+              "api/scan-options"
+            ]
+          },
+          {
+            "group": "Configuration",
+            "pages": [
+              "api/settings",
+              "api/compactor-builder",
+              "api/garbage-collector-builder"
+            ]
+          },
+          {
+            "group": "Operations",
+            "pages": [
+              "api/merge-operator",
+              "api/compaction-filter",
+              "api/write-batch"
+            ]
+          },
+          {
+            "group": "Types",
+            "pages": [
+              "api/error",
+              "api/key-value"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "LSM-tree storage engine built on object storage (S3, GCS, Azure)",
+    "ACID transactions with configurable isolation levels",
+    "Snapshots and checkpoints for consistent point-in-time reads",
+    "Range queries with efficient scanning",
+    "Automatic compaction and garbage collection",
+    "Change data capture (CDC) for streaming updates",
+    "Multiple compression algorithms (Snappy, LZ4, Zstd)",
+    "Block and disk caching for performance optimization",
+    "Merge operators for atomic read-modify-write",
+    "Language bindings for Rust, Go, Java, and Python"
+  ],
+  "publicApiSurface": [
+    "Db::open",
+    "Db::put",
+    "Db::get",
+    "Db::delete",
+    "Db::scan",
+    "Db::close",
+    "DbBuilder",
+    "DbTransaction",
+    "DbSnapshot",
+    "DbIterator",
+    "WriteBatch",
+    "Checkpoint",
+    "MergeOperator",
+    "CompactionFilter",
+    "Settings",
+    "CompactorBuilder",
+    "GarbageCollectorBuilder"
+  ]
+}
